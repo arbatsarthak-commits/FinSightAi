@@ -1,0 +1,31 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      INVOICE_DB_PATH: /data/ocr_master_table.db
+      INVOICE_DATA_DIR: /data/input
+      TESSERACT_CMD: /usr/bin/tesseract
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral}
+      LOCAL_API_TOKEN: ${LOCAL_API_TOKEN:?Set LOCAL_API_TOKEN to a random value of at least 32 characters}
+      FRONTEND_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,https://arbatsarthak-commits.github.io
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - invoice-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  invoice-data:

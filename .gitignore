@@ -15,8 +15,16 @@ frontend/dist/
 
 # Environment and secrets
 .env
+.local-api-token
 .env.*
 !.env.example
+
+# Private invoice documents and generated uploads
+data/input/
+inputocrimage/
+uploads/
+data/processed/
+screenshots/
 
 # Local databases
 *.db
@@ -28,13 +36,14 @@ frontend/dist/
 # Generated files
 extracted_text.txt
 outputocrimage/
-uploads/
-data/processed/
 
 # Model weights
 *.pt
 *.pth
 *.safetensors
+*.gguf
+*.onnx
+*.bin
 
 # OS files
 .DS_Store

@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+__pycache__
+.pytest_cache
+.env
+.local-api-token
+*.db
+*.db-journal
+data/input
+data/processed
+models
+screenshots
+frontend/node_modules
+frontend/dist
