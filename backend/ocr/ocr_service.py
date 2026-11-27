@@ -1,6 +1,8 @@
+import copy
 import pytesseract
 import cv2
 import hashlib
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -14,6 +16,53 @@ from backend.preprocessing.image_processor import preprocess_image, SUPPORTED_IM
 _OCR_CACHE: dict[tuple[str, str, int], dict] = {}
 MAX_PDF_PAGE_PIXELS = 12_000_000
 MAX_PDF_TOTAL_PIXELS = 60_000_000
+
+
+def _ocr_quality_score(data: dict) -> float:
+    confidences = [
+        float(value)
+        for value in data.get("conf", [])
+        if str(value).strip() and float(value) >= 0
+    ]
+    average_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    grouped_lines: dict[tuple[int, int, int], list[str]] = {}
+    texts = data.get("text", [])
+    for index, value in enumerate(texts):
+        text = str(value).strip()
+        if not text:
+            continue
+        key = (
+            int(data.get("block_num", [0] * len(texts))[index]),
+            int(data.get("par_num", [0] * len(texts))[index]),
+            int(data.get("line_num", [index] * len(texts))[index]),
+        )
+        grouped_lines.setdefault(key, []).append(text)
+    lines = [" ".join(words) for words in grouped_lines.values()]
+    score = average_confidence
+    score += 5 * sum(
+        bool(
+            re.search(
+                r"\b(?:sub\s*total|grand\s*total|total|cgst|sgst|igst)\b.*\d",
+                line,
+                re.IGNORECASE,
+            )
+        )
+        for line in lines
+    )
+    score += 3 * sum(
+        bool(re.search(r"[A-Za-z]", line))
+        and len(re.findall(r"\d+(?:[.,]\d+)?", line)) >= 2
+        for line in lines
+    )
+    score += 3 * sum(
+        bool(re.search(r"\b(?:invoice|bill)\b.*\d", line, re.IGNORECASE))
+        for line in lines
+    )
+    score += 3 * sum(
+        bool(re.search(r"\bdate\b.*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", line, re.IGNORECASE))
+        for line in lines
+    )
+    return score
 
 
 class RenderedPagePaths(list[Path]):
@@ -137,14 +186,24 @@ def extract_document(
     pdf_conversion_seconds = 0.0
     temporary_directory = None
     total_pages = 1
+    cache_lookup_started = time.perf_counter()
     cache_key = (
         str(source.resolve()),
         hashlib.sha256(source.read_bytes()).hexdigest(),
         max_pages,
     )
+    cache_lookup_seconds = time.perf_counter() - cache_lookup_started
     cached = _OCR_CACHE.get(cache_key)
     if cached is not None:
-        return cached.copy()
+        result = copy.deepcopy(cached)
+        result["performance"] = {
+            "pdf_conversion_seconds": 0.0,
+            "preprocessing_seconds": 0.0,
+            "ocr_seconds": 0.0,
+            "ocr_cache_hit": True,
+            "ocr_cache_lookup_seconds": round(cache_lookup_seconds, 4),
+        }
+        return result
     if suffix == ".pdf":
         temporary_directory = tempfile.TemporaryDirectory(prefix="invoice_pages_")
         started = time.perf_counter()
@@ -189,7 +248,6 @@ def extract_document(
             preprocessing_seconds += time.perf_counter() - started
             if on_stage:
                 on_stage("OpenCV preprocessing", "Complete", f"Page {page_number}")
-
             words = []
             lines = {}
             if cv2.countNonZero(255 - processed) >= 10:
@@ -207,31 +265,77 @@ def extract_document(
                     raise TimeoutError(
                         f"OCR timed out on page {page_number} after {OCR_TIMEOUT_SECONDS} seconds."
                     ) from exc
-                preliminary_confidences = [
-                    float(conf)
-                    for conf in data["conf"]
-                    if str(conf).strip() and float(conf) >= 0
+                selected_data = data
+                selected_score = _ocr_quality_score(data)
+                confidences = [
+                    float(value)
+                    for value in data["conf"]
+                    if str(value).strip() and float(value) >= 0
                 ]
-                preliminary_word_count = sum(1 for text in data["text"] if str(text).strip())
-                preliminary_average = (
-                    sum(preliminary_confidences) / len(preliminary_confidences)
-                    if preliminary_confidences else 0.0
+                average_confidence = (
+                    sum(confidences) / len(confidences) if confidences else 0.0
                 )
-                if preliminary_word_count == 0 or preliminary_average < 45:
+                if average_confidence < 65:
+                    if on_stage:
+                        on_stage(
+                            "OpenCV preprocessing", "Processing",
+                            f"Adaptive fallback for page {page_number}",
+                        )
+                    preprocessing_started = time.perf_counter()
+                    adaptive = preprocess_image(page_path, adaptive=True)
+                    preprocessing_seconds += time.perf_counter() - preprocessing_started
+                    if on_stage:
+                        on_stage("OpenCV preprocessing", "Complete", f"Page {page_number}")
                     try:
-                        data = pytesseract.image_to_data(
+                        adaptive_data = pytesseract.image_to_data(
+                            adaptive,
+                            config="--psm 6",
+                            output_type=pytesseract.Output.DICT,
+                            timeout=OCR_TIMEOUT_SECONDS,
+                        )
+                    except pytesseract.TesseractError as exc:
+                        raise RuntimeError(
+                            f"Adaptive OCR failed on page {page_number}: {exc}"
+                        ) from exc
+                    except RuntimeError as exc:
+                        raise TimeoutError(
+                            f"Adaptive OCR timed out on page {page_number} after "
+                            f"{OCR_TIMEOUT_SECONDS} seconds."
+                        ) from exc
+                    adaptive_score = _ocr_quality_score(adaptive_data)
+                    if adaptive_score > selected_score:
+                        selected_data = adaptive_data
+                        selected_score = adaptive_score
+                        processed = adaptive
+                selected_confidences = [
+                    float(value)
+                    for value in selected_data["conf"]
+                    if str(value).strip() and float(value) >= 0
+                ]
+                selected_average = (
+                    sum(selected_confidences) / len(selected_confidences)
+                    if selected_confidences else 0.0
+                )
+                if selected_average < 45:
+                    try:
+                        sparse_data = pytesseract.image_to_data(
                             processed,
                             config="--psm 11",
                             output_type=pytesseract.Output.DICT,
                             timeout=OCR_TIMEOUT_SECONDS,
                         )
                     except pytesseract.TesseractError as exc:
-                        raise RuntimeError(f"OCR fallback failed on page {page_number}: {exc}") from exc
+                        raise RuntimeError(
+                            f"Sparse OCR fallback failed on page {page_number}: {exc}"
+                        ) from exc
                     except RuntimeError as exc:
                         raise TimeoutError(
-                            f"OCR fallback timed out on page {page_number} after "
+                            f"Sparse OCR fallback timed out on page {page_number} after "
                             f"{OCR_TIMEOUT_SECONDS} seconds."
                         ) from exc
+                    if _ocr_quality_score(sparse_data) > selected_score:
+                        selected_data = sparse_data
+                data = selected_data
                 ocr_seconds += time.perf_counter() - started
                 if on_stage:
                     on_stage("Tesseract OCR", "Complete", f"Page {page_number}")
@@ -251,6 +355,9 @@ def extract_document(
                         "top": int(data["top"][index]),
                         "width": int(data["width"][index]),
                         "height": int(data["height"][index]),
+                        "block_num": int(data.get("block_num", [0] * len(data["text"]))[index]),
+                        "par_num": int(data.get("par_num", [0] * len(data["text"]))[index]),
+                        "line_num": int(data.get("line_num", [index] * len(data["text"]))[index]),
                         "page": page_number,
                     })
                     line_key = (
@@ -299,6 +406,8 @@ def extract_document(
             "pdf_conversion_seconds": round(pdf_conversion_seconds, 4),
             "preprocessing_seconds": round(preprocessing_seconds, 4),
             "ocr_seconds": round(ocr_seconds, 4),
+            "ocr_cache_hit": False,
+            "ocr_cache_lookup_seconds": round(cache_lookup_seconds, 4),
         },
     }
     if len(_OCR_CACHE) >= 16:

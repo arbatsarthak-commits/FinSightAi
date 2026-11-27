@@ -1,4 +1,6 @@
+import json
 import os
+import sqlite3
 import threading
 import time
 from io import BytesIO
@@ -312,7 +314,11 @@ def test_invoice_correction_revalidates_financial_totals(tmp_path, monkeypatch):
         }],
     }
     invoice_id = save_extracted_invoice(
-        main.DB_PATH, invoice, "correction.png", {"status": "Verified"}, "{}"
+        main.DB_PATH,
+        invoice,
+        "correction.png",
+        {"status": "Verified"},
+        json.dumps(invoice),
     )
 
     invalid = client.put(
@@ -354,3 +360,80 @@ def test_assistant_endpoint_returns_database_answer_not_sql(tmp_path, monkeypatc
     assert response.status_code == 200
     assert "₹36.00" in response.json()["answer"]
     assert "query" not in response.json()
+
+
+def test_processing_job_queues_optional_enrichment_after_invoice_save(tmp_path, monkeypatch):
+    db_path = tmp_path / "optional-enrichment.db"
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    initialize_database(db_path)
+    job_id = "optional-enrichment-job"
+    monkeypatch.setattr(main, "_processing_jobs", {
+        job_id: {
+            "job_id": job_id,
+            "upload_id": "upload.png",
+            "status": "queued",
+            "current_stage": "Queued",
+            "stages": {},
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    })
+    submitted = []
+
+    class FakeExecutor:
+        def submit(self, *args):
+            submitted.append(args)
+
+    monkeypatch.setattr(main, "_enrichment_executor", FakeExecutor())
+    monkeypatch.setattr(
+        main,
+        "process_invoice",
+        lambda *args, **kwargs: {
+            "invoice_id": 12,
+            "auto_saved": True,
+            "enrichment_recommended": ["vendor_name"],
+            "ocr": {"text": "Stored OCR text"},
+        },
+    )
+    source = tmp_path / "upload.png"
+    source.write_bytes(b"test")
+
+    main._run_processing_job(job_id, "upload.png", source, 0.01)
+
+    assert main._processing_jobs[job_id]["status"] == "complete"
+    assert main._processing_jobs[job_id]["result"]["enrichment_status"] == "queued"
+    assert submitted == [(
+        main._run_optional_enrichment, 12, "Stored OCR text", ["vendor_name"]
+    )]
+
+
+def test_optional_model_failure_is_recorded_without_undoing_saved_invoice(tmp_path, monkeypatch):
+    db_path = tmp_path / "optional-model-failure.db"
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    initialize_database(db_path)
+    invoice_id = save_extracted_invoice(
+        db_path,
+        {"invoice_number": "INV-OPTIONAL", "items": []},
+        "optional.png",
+        {"status": "Needs Attention"},
+        "{}",
+        enrichment_status="queued",
+    )
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("Ollama model 'qwen2.5:1.5b' is not installed.")
+
+    monkeypatch.setattr(main, "suggest_invoice_enrichment", unavailable)
+
+    main._run_optional_enrichment(invoice_id, "OCR facts only", ["vendor_name"])
+
+    details = main.get_invoice_details(db_path, invoice_id)
+    assert details["invoice"]["enrichment_status"] == "unavailable"
+    assert "not installed" in details["invoice"]["enrichment_error"]
+    with sqlite3.connect(db_path) as connection:
+        stage = connection.execute(
+            "SELECT status FROM performance_metrics WHERE invoice_id=? "
+            "AND stage='optional_ai_enrichment'",
+            (invoice_id,),
+        ).fetchone()
+    assert stage == ("unavailable",)

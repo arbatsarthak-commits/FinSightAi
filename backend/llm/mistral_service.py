@@ -269,6 +269,31 @@ def extract_invoice(raw_text: str, retries: int = 1) -> InvoiceData:
     return invoice
 
 
+def suggest_invoice_enrichment(raw_text: str, requested_fields: list[str]) -> tuple[dict, dict]:
+    extracted, metrics = extract_invoice_with_metrics(raw_text, retries=0)
+    values = extracted.model_dump()
+    suggestions = {}
+    for field in requested_fields:
+        if field in {
+            "invoice_number", "invoice_date", "due_date", "vendor_name", "vendor_gstin",
+            "customer_name", "customer_gstin", "subtotal", "cgst", "sgst", "igst",
+            "total_tax", "grand_total", "currency", "payment_status",
+        }:
+            if values.get(field) not in (None, ""):
+                suggestions[field] = values[field]
+        elif field == "line_items" and values.get("items"):
+            suggestions[field] = values["items"]
+        elif field == "categories":
+            categories = [
+                {"description": item.get("description"), "category": item.get("category")}
+                for item in values.get("items", [])
+                if item.get("category") not in (None, "", "Other")
+            ]
+            if categories:
+                suggestions[field] = categories
+    return suggestions, metrics
+
+
 def ollama_status() -> dict:
     memory = {"ram_total_bytes": None, "ram_available_bytes": None}
     if os.name == "nt":

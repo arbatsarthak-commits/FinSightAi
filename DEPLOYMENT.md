@@ -3,16 +3,53 @@
 ## Deployment model
 
 GitHub Pages serves the React/Vite frontend at
-<https://arbatsarthak-commits.github.io/FinSightAi/>. FastAPI, Ollama/Qwen,
-Tesseract/OpenCV, invoice uploads, and SQLite remain on the user's Windows
-computer. The static website is not a backend host and does not receive local
-database files or invoice documents as part of deployment.
+<https://arbatsarthak-commits.github.io/FinSightAi/>. FastAPI, Tesseract/OpenCV,
+invoice uploads, and SQLite remain on the user's Windows computer. Ollama/Qwen
+is optional. The static website is not a backend host and does not receive
+local database files or invoice documents as part of deployment.
 
-The frontend deliberately calls `http://127.0.0.1:8000`, which means the
-computer running the browser. The user must start the backend on that same
-computer and enter its locally generated pairing token in **Connect backend**.
-The token remains in frontend memory and is sent in the `X-Pairing-Token`
-header. Never provide it as a `VITE_*` setting or build secret.
+The Pages build has no fixed backend URL. The user must start the backend on
+the same computer that should process invoices, choose **Connect backend**,
+enter a loopback URL such as `http://127.0.0.1:8000`, and provide its locally
+generated pairing token. The token remains in frontend memory and is sent in
+the `X-Pairing-Token` header. Never provide it as a `VITE_*` setting or build
+secret.
+
+The current supported deployment is local and single-instance. The backend
+uses SQLite and local filesystem storage plus a shared pairing token; it does
+not provide per-user identity, tenant isolation, managed object storage, or
+multi-instance database coordination. Do not expose this service publicly or
+use a shared token as the only protection for a multi-user cloud deployment.
+
+## Requirements before a cloud deployment
+
+The application has environment-configurable API, SQLite path, file-storage
+path, OCR executable, LLM endpoint/model, CORS origins, and upload limit. These
+settings are building blocks, not a complete cloud hosting configuration.
+Before serving it remotely:
+
+1. Put the backend behind a TLS-terminating reverse proxy and publish only
+   HTTPS. Do not expose the container/API port directly to the internet.
+2. Set `APP_ENV=production` and `FRONTEND_ORIGINS` to the exact trusted
+   frontend origins. Keep CORS credentials disabled and allow only required
+   methods/headers.
+3. Keep `LOCAL_API_TOKEN` in a secret manager with at least 32 random
+   characters. The current token is a shared bearer secret, not user
+   authentication. Add identity-aware authentication and authorization before
+   allowing multiple users or public access.
+4. Set `INVOICE_DB_PATH` and `INVOICE_DATA_DIR` to persistent mounted storage,
+   back up both, and run exactly one backend instance with SQLite. The current
+   application does not implement cloud object-storage adapters or
+   multi-instance coordination.
+5. Set `MAX_UPLOAD_BYTES` to a deployment-appropriate limit and enforce
+   request/body limits at the reverse proxy as well. Keep Ollama private and
+   internal if optional enrichment is enabled.
+6. Build the frontend with `VITE_API_BASE_URL=https://<your-api-host>`; the
+   frontend rejects remote HTTP URLs. Never put the API token in frontend
+   build variables.
+
+These controls are prerequisites, not evidence that the project has been
+deployed or penetration-tested in a cloud environment.
 
 ## GitHub Pages setup
 
@@ -34,13 +71,14 @@ to `127.0.0.1`; do not bind it publicly or configure a router port-forward.
 ## Run and connect the local backend
 
 Install the prerequisites and Python dependencies as described in
-[README.md](README.md). Start Ollama and ensure `qwen2.5:1.5b` is available. In a
+[README.md](README.md). Ollama is optional; when enrichment is desired, make
+sure the configured model is installed. In a
 PowerShell terminal at the repository root, set any local overrides and start
 FastAPI:
 
 ```powershell
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
-$env:OLLAMA_HOST = 'http://localhost:11434'
+$env:OLLAMA_HOST = 'http://127.0.0.1:11434'
 $env:OLLAMA_MODEL = 'qwen2.5:1.5b'
 $env:FRONTEND_ORIGINS = 'http://127.0.0.1:5173,http://localhost:5173,https://arbatsarthak-commits.github.io'
 .\start_backend.ps1

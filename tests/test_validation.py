@@ -47,6 +47,48 @@ def test_tax_inclusive_item_amount_is_not_compared_as_taxable_subtotal():
     assert result["status"] == "Verified"
 
 
+def test_item_amounts_reconcile_to_subtotal_when_invoice_has_summary_tax():
+    invoice = {
+        "invoice_number": "INV-LINE-TAX",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 549,
+        "cgst": 13.55,
+        "sgst": 13.55,
+        "igst": 0,
+        "total_tax": 27.1,
+        "grand_total": 576.1,
+        "items": [
+            {"description": "First", "quantity": 1, "unit_price": 399, "amount": 399},
+            {"description": "Second", "quantity": 1, "unit_price": 150, "amount": 150},
+        ],
+    }
+
+    result = validate_invoice(invoice)
+
+    assert result["status"] == "Verified"
+
+
+def test_item_amounts_mismatching_subtotal_and_grand_total_fail_reconciliation():
+    invoice = {
+        "invoice_number": "INV-LINE-MISMATCH",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 549,
+        "cgst": 13.55,
+        "sgst": 13.55,
+        "igst": 0,
+        "total_tax": 27.1,
+        "grand_total": 576.1,
+        "items": [{"description": "First", "amount": 500}],
+    }
+
+    result = validate_invoice(invoice)
+
+    assert result["status"] == "Validation Failed"
+    assert any("item taxable amounts sum" in error for error in result["errors"])
+
+
 def test_missing_subtotal_and_line_items_needs_attention():
     result = validate_invoice({
         "invoice_number": "INV-INCOMPLETE",

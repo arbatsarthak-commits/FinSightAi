@@ -79,28 +79,44 @@ def validate_invoice(invoice: dict, existing_invoice_numbers: Iterable[str] = ()
                 )
         if taxable_value is not None:
             item_sum += money(taxable_value)
-        elif amount is not None and not item_tax and money(invoice.get("total_tax")) == 0:
+        elif amount is not None and not item_tax:
             item_sum += money(amount)
         elif amount is not None:
             item_sum_comparable = False
 
     subtotal = money(invoice.get("subtotal"))
-    if subtotal == 0 and item_sum_comparable and item_sum != 0:
-        subtotal = item_sum
-    if subtotal != 0 and item_sum != 0 and item_sum_comparable and subtotal != item_sum:
+    has_subtotal = invoice.get("subtotal") is not None
+    amount_sum_matches_grand_total = (
+        money(invoice.get("total_tax")) != 0
+        and item_sum == money(invoice.get("grand_total"))
+    )
+    if (
+        has_subtotal
+        and subtotal != item_sum
+        and item_sum != 0
+        and item_sum_comparable
+        and not amount_sum_matches_grand_total
+    ):
         errors.append(f"Subtotal is {subtotal}, but item taxable amounts sum to {item_sum}.")
+    if not has_subtotal and item_sum != 0:
+        warnings.append("Subtotal is missing; the line-item sum cannot be reconciled to it.")
 
     total_tax = money(invoice.get("total_tax"))
-    tax_parts = sum(
-        (money(invoice.get("cgst")), money(invoice.get("sgst")), money(invoice.get("igst"))),
-        Decimal("0"),
-    )
+    tax_values = [invoice.get(field) for field in ("cgst", "sgst", "igst")]
+    has_tax_components = any(value is not None for value in tax_values)
+    if has_tax_components and not all(value is not None for value in tax_values):
+        warnings.append("The GST component breakdown is incomplete; review CGST, SGST, and IGST.")
+    if has_tax_components and invoice.get("total_tax") is None:
+        warnings.append("Total tax is missing; tax components cannot be fully reconciled.")
+    if invoice.get("total_tax") is not None and total_tax != 0 and not has_tax_components:
+        warnings.append("Tax components are missing; review the GST breakdown.")
+    tax_parts = sum((money(value) for value in tax_values), Decimal("0"))
     if total_tax != 0 and tax_parts != 0 and total_tax != tax_parts:
         errors.append("Total tax does not equal CGST + SGST + IGST.")
 
     grand_total = money(invoice.get("grand_total"))
     calculated_total = subtotal + (tax_parts if tax_parts != 0 else total_tax)
-    if grand_total != 0 and calculated_total != 0 and grand_total != calculated_total:
+    if has_subtotal and grand_total != 0 and calculated_total != 0 and grand_total != calculated_total:
         errors.append(
             f"Grand total is {grand_total}, but subtotal + tax is {calculated_total}."
         )

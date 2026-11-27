@@ -1,16 +1,17 @@
 # Model Evaluation
 
-No fine-tuned LayoutLMv3 checkpoint or labelled invoice dataset is included. Therefore, no pretrained accuracy claim or fabricated score is made.
+No manually labelled invoice evaluation dataset or fine-tuned LayoutLMv3 checkpoint is included. Existing `corrected_data` values are populated by the application save path and are not human-verified ground truth. Therefore, an overall extraction-accuracy score cannot be calculated from the current database.
 
-Evaluate extraction by comparing approved fields against a manually reviewed test set. Report exact match, field-level recall and precision. Compare OCR-only, OCR+Mistral and OCR+Mistral+LayoutLMv3 when a valid checkpoint is available.
+Evaluate extraction by comparing fields against a separately maintained, manually reviewed test set. Report exact match, field-level precision/recall, confidence calibration, and reconciliation outcomes separately for headers, GST, line items, and totals. Keep uncertain values and source OCR evidence available for audit. Compare deterministic OCR-only processing with optional model suggestions only when a labelled test set and identical hardware/settings are used. Do not treat model suggestions as verified values or ground truth.
 
 ## Recommended local inference settings
 
-The default local configuration uses 2048 context tokens, 350 maximum generated
-tokens, up to eight CPU threads, and a ten-minute Ollama model retention period.
-The OCR text sent to Mistral is limited to 6000 characters. These defaults reduce
-prompt and generation work while preserving the end and beginning of longer OCR
-documents. All values can be overridden with `OLLAMA_NUM_CTX`,
+The default optional local configuration uses Qwen 2.5 1.5B, 2048 context
+tokens, 350 maximum generated tokens, up to eight CPU threads, and a ten-minute
+Ollama model retention period. OCR text sent for enrichment is limited to 6000
+characters. These settings affect optional enrichment only; ordinary invoice
+uploads and deterministic chat queries do not require Ollama. Values can be
+overridden with `OLLAMA_MODEL`, `OLLAMA_NUM_CTX`,
 `OLLAMA_NUM_PREDICT`, `OLLAMA_NUM_THREAD`, `OLLAMA_KEEP_ALIVE`, and
 `OCR_TEXT_LIMIT`.
 

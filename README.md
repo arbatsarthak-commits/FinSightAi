@@ -1,13 +1,14 @@
 # FinSightAI
 
-FinSightAI is a React dashboard backed by a FastAPI service that runs on your Windows computer. The browser uploads invoices to that local service; Tesseract and OpenCV process them, Ollama runs configurable Qwen extraction, and SQLite stores the results locally. GitHub Pages hosts only the static frontend.
+FinSightAI is a React dashboard backed by a FastAPI service. Invoice uploads are processed with OpenCV, Tesseract OCR, and deterministic Python extraction, then saved with evidence and validation details in SQLite. Ollama/Qwen is optional and is used only for separate enrichment when deterministic extraction needs help. GitHub Pages hosts only the static frontend.
 
 ## Features
 
-- JPG, PNG, and PDF invoice uploads with OpenCV preprocessing and Tesseract OCR
-- Qwen 2.5 1.5B/Ollama structured extraction by default; Qwen 2.5 3B is configurable where additional extraction capacity is preferred
+- JPG, PNG, and PDF invoice uploads with file validation, OpenCV preprocessing, and Tesseract OCR
+- Coordinate-aware invoice and line-item extraction, OCR evidence, field confidence, and GST/total reconciliation
+- Optional Qwen 2.5 1.5B enrichment, configurable through `OLLAMA_MODEL`; no model is required for ordinary uploads or database-backed queries
 - GST-aware financial validation and file/invoice-number duplicate detection
-- SQLite invoice history, processing logs, CSV export, and verified-expense analytics
+- SQLite invoice history, OCR traceability, field-level evidence, stage metrics, processing logs, CSV export, and verified-expense analytics
 - Dashboard charts, restart-aware processing jobs, and a conversational assistant using fixed, parameterized SQLite queries
 - Authenticated invoice corrections and deletion, OCR field evidence, and local hardware/model status
 - Optional LayoutLMv3 checkpoint inference; the standard workflow does not require it
@@ -19,9 +20,10 @@ Browser (local Vite or GitHub Pages)
   └─ explicit Connect backend + local pairing token
       └─ FastAPI on 127.0.0.1:8000
           ├─ invoice upload and processing status
-          ├─ OpenCV preprocessing → Tesseract OCR
-          ├─ Ollama / Qwen extraction and validation
-          └─ local SQLite database and analytics
+          ├─ deterministic fields, line items, evidence, and financial validation
+          ├─ SQLite invoices, OCR traceability, and stage metrics
+          ├─ optional background Ollama enrichment
+          └─ parameterized database-grounded financial assistant
 ```
 
 The backend is not hosted by GitHub Pages and is not exposed to the public internet. The browser submits the pairing token only after the user enters it; it stays in memory and is not built into the frontend. The backend accepts only configured frontend origins and binds to loopback when started with the supplied script.
@@ -32,7 +34,7 @@ The backend is not hosted by GitHub Pages and is not exposed to the public inter
 - Python 3.11 or later (use a version compatible with the pinned packages)
 - Node.js 24 and npm
 - Tesseract OCR 5, installed locally
-- Ollama, with `qwen2.5:1.5b` downloaded (optional alternative: `qwen2.5:3b`)
+- Optional: Ollama with the configured model installed (default `qwen2.5:1.5b`)
 
 ## Local setup
 
@@ -57,13 +59,13 @@ If PowerShell blocks environment activation, either adjust the policy for the cu
 
 ### Ollama and Qwen
 
-Install Ollama, then download the model:
+Ollama is optional. Ordinary invoice processing and supported financial questions work without it. To enable background enrichment for ambiguous fields or line items, install Ollama and the configured model:
 
 ```powershell
 ollama pull qwen2.5:1.5b
 ```
 
-For the optional accuracy-oriented profile, install `ollama pull qwen2.5:3b` and select it with `OLLAMA_MODEL=qwen2.5:3b`. Ollama normally starts its local service automatically. If it is not running, start `ollama serve` in a separate terminal. The backend defaults to `http://localhost:11434` and model `qwen2.5:1.5b`. The backend reports whether the selected model is installed and will not download models automatically.
+Set `OLLAMA_MODEL` to another locally installed model when desired. Ollama normally starts its local service automatically; otherwise run `ollama serve`. The backend defaults to `http://127.0.0.1:11434` and `qwen2.5:1.5b`; it never downloads a model automatically. Enrichment suggestions are stored separately and do not overwrite saved invoice fields or validation status.
 
 ### Tesseract OCR
 
@@ -90,7 +92,7 @@ In the backend terminal, optionally set local service configuration and start Fa
 
 ```powershell
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
-$env:OLLAMA_HOST = 'http://localhost:11434'
+$env:OLLAMA_HOST = 'http://127.0.0.1:11434'
 $env:OLLAMA_MODEL = 'qwen2.5:1.5b'
 $env:OLLAMA_NUM_CTX = '2048'
 $env:OLLAMA_NUM_PREDICT = '350'
@@ -130,9 +132,9 @@ The workflow at `.github/workflows/deploy.yml` deploys the frontend when code is
 3. Check that the build and deploy jobs complete successfully.
 4. Visit <https://arbatsarthak-commits.github.io/FinSightAi/>.
 
-Pages serves only static frontend assets. It does not host FastAPI, Tesseract, Ollama, the pairing token, invoices, or SQLite. To use the hosted page, start the backend on the Windows computer that should process the invoices, then select **Connect backend** on the hosted page and enter that computer's local pairing token. The production frontend's `http://127.0.0.1:8000` API address deliberately means the visitor's own computer; it is not a public backend URL or a Vite development-server address.
+Pages serves only static frontend assets. It does not host FastAPI, Tesseract, Ollama, the pairing token, invoices, or SQLite. The Pages build has no fixed backend URL. To use it, start the backend on the Windows computer that should process invoices, choose **Connect backend**, enter that computer's loopback API URL and local pairing token. The loopback URL refers to the visitor's own computer, not a public backend or a Vite development server.
 
-The backend already allows the Pages origin `https://arbatsarthak-commits.github.io` in CORS. Origins are host-only: do not append `/FinSightAi/`. Keep `LOCAL_API_TOKEN` on the backend. Never set it as a `VITE_*` value, GitHub Actions build variable, or frontend environment variable.
+The backend already allows the Pages origin `https://arbatsarthak-commits.github.io` in local mode. Origins are host-only: do not append `/FinSightAi/`. Keep `LOCAL_API_TOKEN` on the backend. Never set it as a `VITE_*` value, GitHub Actions build variable, or frontend environment variable. The current backend is a single-instance SQLite/filesystem application with shared-token authentication, not a multi-tenant cloud service; see [DEPLOYMENT.md](DEPLOYMENT.md) before considering any remote deployment.
 
 ### Browser and local-network limitations
 
@@ -145,7 +147,7 @@ The site is HTTPS while the local API uses HTTP on loopback. Chrome's Local Netw
 - **Backend connection fails:** confirm the backend terminal is still running at `127.0.0.1:8000`, use the current pairing token, and check the browser's local-network permission. For the hosted app, the CORS origin must be exactly `https://arbatsarthak-commits.github.io`.
 - **Unauthorized response:** reconnect and enter the token printed by the currently running backend. Do not put that token in a URL, source file, frontend `.env`, or GitHub configuration.
 - **OCR unavailable:** install Tesseract and set `TESSERACT_CMD` to its executable path before starting the backend.
-- **Selected model unavailable:** start Ollama, run `ollama pull qwen2.5:1.5b`, and confirm `OLLAMA_HOST` and `OLLAMA_MODEL` in `.env` or the backend terminal.
+- **Optional enrichment unavailable:** ordinary OCR uploads and supported database queries still work. Start Ollama, install the configured model if needed, and confirm `OLLAMA_HOST` and `OLLAMA_MODEL` in `.env` or the backend terminal.
 - **Port is already in use:** stop the other local service or configure a coordinated port change in the backend, frontend API URL, and CORS settings.
 
 ## Local checks

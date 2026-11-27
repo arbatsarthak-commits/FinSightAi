@@ -8,7 +8,7 @@ services:
       INVOICE_DATA_DIR: /data/input
       TESSERACT_CMD: /usr/bin/tesseract
       OLLAMA_HOST: http://host.docker.internal:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b}
       LOCAL_API_TOKEN: ${LOCAL_API_TOKEN:?Set LOCAL_API_TOKEN to a random value of at least 32 characters}
       FRONTEND_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,https://arbatsarthak-commits.github.io
     ports:

@@ -95,11 +95,59 @@ def test_ocr_uses_one_tesseract_pass_and_reconstructs_lines(tmp_path, monkeypatc
     )
 
     result = extract_document(image_path)
+    warm_result = extract_document(image_path)
 
     assert calls == ["data"]
     assert result["text"] == "Invoice 123"
     assert result["pages"][0]["average_confidence"] == 92.5
     assert "preprocessing_seconds" in result["performance"]
+    assert result["performance"]["ocr_cache_hit"] is False
+    assert warm_result["performance"]["ocr_cache_hit"] is True
+    assert warm_result["performance"]["ocr_seconds"] == 0
+    assert warm_result["performance"]["ocr_cache_lookup_seconds"] >= 0
+
+
+def test_low_confidence_ocr_uses_adaptive_preprocessing_when_it_improves_invoice_text(
+    tmp_path, monkeypatch
+):
+    image_path = tmp_path / "adaptive-invoice.png"
+    image = np.full((200, 300, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (20, 20), (200, 80), (0, 0, 0), -1)
+    cv2.imwrite(str(image_path), image)
+    preprocessing_modes = []
+    ocr_modes = []
+
+    def fake_preprocess(source, adaptive=False):
+        preprocessing_modes.append(adaptive)
+        return np.zeros((200, 300), dtype=np.uint8)
+
+    def fake_image_to_data(image, config, **kwargs):
+        ocr_modes.append(config)
+        adaptive = len(ocr_modes) > 1
+        words = ["Subtotal", "549", "CGST", "13.55", "Item", "1", "150", "150"] if adaptive else ["noise"]
+        line_numbers = [1, 1, 2, 2, 3, 3, 3, 3] if adaptive else [1]
+        return {
+            "text": words,
+            "conf": ["50"] * len(words),
+            "left": [index * 20 for index in range(len(words))],
+            "top": [10] * len(words),
+            "width": [15] * len(words),
+            "height": [10] * len(words),
+            "block_num": [1] * len(words),
+            "par_num": [1] * len(words),
+            "line_num": line_numbers,
+        }
+
+    monkeypatch.setattr(ocr_service, "check_tesseract", lambda: "5.5")
+    monkeypatch.setattr(ocr_service, "preprocess_image", fake_preprocess)
+    monkeypatch.setattr(ocr_service.pytesseract, "image_to_data", fake_image_to_data)
+
+    result = extract_document(image_path)
+
+    assert preprocessing_modes == [False, True]
+    assert ocr_modes == ["--psm 6", "--psm 6"]
+    assert "Subtotal 549" in result["text"]
+    assert result["performance"]["preprocessing_seconds"] >= 0
 
 
 def test_pdf_page_images_are_cleaned_after_extraction(tmp_path, monkeypatch):

@@ -22,7 +22,24 @@ def _load_local_env() -> None:
 
 
 _load_local_env()
-DB_PATH = Path(os.getenv("INVOICE_DB_PATH", BASE_DIR / "ocr_master_table.db"))
+
+
+def _configured_path(name: str, default: Path) -> Path:
+    value = Path(os.getenv(name, str(default))).expanduser()
+    return value if value.is_absolute() else BASE_DIR / value
+
+
+def _configured_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+APP_ENV = os.getenv("APP_ENV", "local").strip().lower()
+DB_PATH = _configured_path("INVOICE_DB_PATH", BASE_DIR / "ocr_master_table.db")
+INVOICE_DATA_DIR = _configured_path("INVOICE_DATA_DIR", BASE_DIR / "data" / "input")
+MAX_UPLOAD_BYTES = _configured_int("MAX_UPLOAD_BYTES", 20 * 1024 * 1024, 1024)
 
 
 def _tesseract_default() -> str:
@@ -41,7 +58,7 @@ def _tesseract_default() -> str:
 
 
 TESSERACT_CMD = _tesseract_default()
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
 LAYOUTLM_MODEL = os.getenv("LAYOUTLM_MODEL", "")
 OCR_TIMEOUT_SECONDS = max(1, int(os.getenv("OCR_TIMEOUT_SECONDS", "25")))

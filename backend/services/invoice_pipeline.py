@@ -1,17 +1,20 @@
 import hashlib
 import json
-import re
 import sqlite3
 import threading
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-from config import DB_PATH
-from backend.database.database import initialize_database, save_extracted_invoice
-from backend.llm.mistral_service import extract_invoice_with_metrics, extract_rule_fields
+from config import DB_PATH, MAX_UPLOAD_BYTES
+from backend.database.database import (
+    initialize_database,
+    record_performance_metrics,
+    save_extracted_invoice,
+)
 from backend.ocr.ocr_service import extract_document
+from backend.services.invoice_extractor import extract_invoice_from_ocr
 from backend.validation.validation_engine import validate_invoice
 
 
@@ -20,6 +23,8 @@ class InvoiceProcessingError(RuntimeError):
 
 
 _processing_lock = threading.Lock()
+_REQUIRED_CONFIDENCE = 0.75
+_REQUIRED_FIELDS = ("invoice_number", "invoice_date", "vendor_name", "grand_total")
 
 
 def file_sha256(path: str | Path) -> str:
@@ -30,60 +35,63 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def field_evidence(raw_text: str, invoice: dict) -> dict:
-    evidence = {}
-    text_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    rules = extract_rule_fields(raw_text)
-    field_aliases = {
-        "invoice_number": ("invoice number", "invoice no", "invoice #", "bill number"),
-        "invoice_date": ("invoice date", "bill date"),
-        "due_date": ("due date", "payment due"),
-        "vendor_name": ("vendor", "from", "billed by"),
-        "vendor_gstin": ("gstin", "gst in", "gst no"),
-        "customer_name": ("bill to", "customer"),
-        "customer_gstin": ("customer gstin", "buyer gstin"),
-        "subtotal": ("subtotal", "taxable amount", "taxable subtotal"),
-        "cgst": ("cgst", "central tax"),
-        "sgst": ("sgst", "state tax"),
-        "igst": ("igst", "integrated tax"),
-        "total_tax": ("total tax", "gst total", "tax amount"),
-        "grand_total": ("grand total", "invoice total", "amount payable", "total payable"),
-        "currency": ("currency",),
-        "payment_status": ("payment status", "status"),
+def _enrichment_candidates(invoice: dict, confidence: dict[str, float]) -> list[str]:
+    candidates = [
+        field for field in _REQUIRED_FIELDS
+        if not invoice.get(field) or confidence.get(field, 0.0) < _REQUIRED_CONFIDENCE
+    ]
+    if not invoice.get("items"):
+        candidates.append("line_items")
+    elif any(item.get("category") in (None, "", "Other") for item in invoice["items"]):
+        candidates.append("categories")
+    return candidates
+
+
+def _apply_confidence_validation(
+    validation: dict, invoice: dict, confidence: dict[str, float]
+) -> dict:
+    validation = {
+        **validation,
+        "warnings": list(validation.get("warnings", [])),
+        "missing_fields": list(validation.get("missing_fields", [])),
     }
-    for field, aliases in field_aliases.items():
+    for field in _REQUIRED_FIELDS:
         value = invoice.get(field)
-        if value in (None, ""):
-            evidence[field] = {"source": "missing", "line": None}
-            continue
-        matches = [
-            line for line in text_lines
-            if any(alias in line.lower() for alias in aliases)
-            or str(value).lower() in line.lower()
-        ]
-        rule_value = rules.get(field)
-        evidence[field] = {
-            "source": "python rule" if rule_value == value else "OCR evidence" if matches else "AI extraction",
-            "line": matches[0][:240] if matches else None,
-        }
-    item_evidence = []
-    for index, item in enumerate(invoice.get("items") or [], start=1):
-        fields = {}
-        for field, value in item.items():
-            if value in (None, ""):
-                fields[field] = {"source": "missing", "line": None}
-                continue
-            matches = [
-                line for line in text_lines
-                if str(value).lower() in line.lower()
-            ]
-            fields[field] = {
-                "source": "OCR evidence" if matches else "AI extraction",
-                "line": matches[0][:240] if matches else None,
-            }
-        item_evidence.append({"item": index, "fields": fields})
-    evidence["items"] = item_evidence
-    return evidence
+        if value and confidence.get(field, 0.0) < _REQUIRED_CONFIDENCE:
+            validation["warnings"].append(
+                f"OCR confidence for {field.replace('_', ' ')} is below the review threshold."
+            )
+    if not invoice.get("items"):
+        validation["warnings"].append(
+            "No invoice line items were detected; review line-item extraction."
+        )
+    if validation.get("errors"):
+        validation["status"] = "Validation Failed"
+    elif validation["warnings"] or validation["missing_fields"]:
+        validation["status"] = "Needs Attention"
+    else:
+        validation["status"] = "Verified"
+    return validation
+
+
+def _metric_rows(performance: dict[str, Any]) -> list[dict[str, Any]]:
+    stages = {
+        "upload": "upload_seconds",
+        "file_validation": "file_validation_seconds",
+        "duplicate_detection": "duplicate_detection_seconds",
+        "pdf_conversion": "pdf_conversion_seconds",
+        "image_preprocessing": "preprocessing_seconds",
+        "ocr": "ocr_seconds",
+        "ocr_cache_lookup": "ocr_cache_lookup_seconds",
+        "deterministic_extraction": "deterministic_extraction_seconds",
+        "financial_validation": "financial_validation_seconds",
+        "database_save": "database_save_seconds",
+    }
+    return [
+        {"stage": stage, "duration_seconds": performance[key]}
+        for stage, key in stages.items()
+        if isinstance(performance.get(key), (int, float))
+    ]
 
 
 def process_invoice(
@@ -92,8 +100,8 @@ def process_invoice(
     upload_seconds: float = 0.0,
 ) -> dict:
     source = Path(source)
-    stages = {}
-    performance = {"upload_seconds": round(upload_seconds, 4)}
+    performance: dict[str, Any] = {"upload_seconds": round(max(upload_seconds, 0.0), 4)}
+    stages: dict[str, str] = {}
     started = time.perf_counter()
 
     def report(stage: str, status: str, detail: str | None = None) -> None:
@@ -103,7 +111,7 @@ def process_invoice(
 
     with _processing_lock:
         report("File validation", "Processing")
-        validation_started = time.perf_counter()
+        stage_started = time.perf_counter()
         suffix = source.suffix.lower()
         if suffix not in {".jpg", ".jpeg", ".png", ".pdf"}:
             raise InvoiceProcessingError("Unsupported file type. Use JPG, JPEG, PNG or PDF.")
@@ -112,15 +120,14 @@ def process_invoice(
         size = source.stat().st_size
         if size == 0:
             raise InvoiceProcessingError("The uploaded file is empty.")
-        if size > 20 * 1024 * 1024:
-            raise InvoiceProcessingError("The uploaded file exceeds the 20 MB limit.")
-        performance["file_validation_seconds"] = round(
-            time.perf_counter() - validation_started, 4
-        )
+        if size > MAX_UPLOAD_BYTES:
+            maximum_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+            raise InvoiceProcessingError(f"The uploaded file exceeds the {maximum_mb} MB limit.")
+        performance["file_validation_seconds"] = round(time.perf_counter() - stage_started, 4)
         report("File validation", "Complete")
 
         report("Duplicate detection", "Processing")
-        duplicate_started = time.perf_counter()
+        stage_started = time.perf_counter()
         source_hash = file_sha256(source)
         initialize_database(DB_PATH)
         with closing(sqlite3.connect(DB_PATH)) as connection:
@@ -129,14 +136,10 @@ def process_invoice(
                    FROM invoices WHERE source_hash = ? LIMIT 1""",
                 (source_hash,),
             ).fetchone()
-        performance["duplicate_detection_seconds"] = round(
-            time.perf_counter() - duplicate_started, 4
-        )
+        performance["duplicate_detection_seconds"] = round(time.perf_counter() - stage_started, 4)
         report("Duplicate detection", "Complete")
         if duplicate:
-            performance["total_processing_seconds"] = round(
-                time.perf_counter() - started, 4
-            )
+            performance["total_processing_seconds"] = round(time.perf_counter() - started, 4)
             performance["total_end_to_end_seconds"] = round(
                 performance["upload_seconds"] + performance["total_processing_seconds"], 4
             )
@@ -154,35 +157,37 @@ def process_invoice(
                 "slowest_stage": "Duplicate detection",
                 "stages": stages,
                 "auto_saved": False,
+                "enrichment_recommended": [],
             }
 
         ocr = extract_document(source, on_stage=report)
         if not ocr["text"].strip():
             raise InvoiceProcessingError("OCR did not detect readable invoice text.")
-        performance.update(ocr.pop("performance"))
+        performance.update(ocr.pop("performance", {}))
+
         report("OCR text cleanup", "Processing")
-        cleanup_started = time.perf_counter()
-        cleaned_text = re.sub(r"[ \t]+", " ", ocr["text"])
-        cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text).strip()
-        ocr["text"] = cleaned_text
-        performance["ocr_text_cleanup_seconds"] = round(
-            time.perf_counter() - cleanup_started, 4
+        stage_started = time.perf_counter()
+        ocr["text"] = "\n".join(
+            " ".join(line.split()) for line in ocr["text"].splitlines() if line.strip()
         )
+        performance["ocr_text_cleanup_seconds"] = round(time.perf_counter() - stage_started, 4)
         report("OCR text cleanup", "Complete")
 
-        report("Mistral invoice extraction", "Processing")
-        invoice_data, model_performance = extract_invoice_with_metrics(ocr["text"])
-        performance.update(model_performance)
-        invoice = invoice_data.model_dump()
-        evidence = field_evidence(ocr["text"], invoice)
-        report("Mistral invoice extraction", "Complete")
+        report("Deterministic extraction", "Processing")
+        stage_started = time.perf_counter()
+        extraction = extract_invoice_from_ocr(ocr)
+        invoice = extraction["invoice"]
+        evidence = extraction["evidence"]
+        confidence = extraction["confidence"]
+        performance["deterministic_extraction_seconds"] = round(time.perf_counter() - stage_started, 4)
+        report("Deterministic extraction", "Complete")
 
         report("Invoice-number duplicate check", "Processing")
-        duplicate_started = time.perf_counter()
+        stage_started = time.perf_counter()
+        duplicate = None
         invoice_number = invoice.get("invoice_number")
-        with closing(sqlite3.connect(DB_PATH)) as connection:
-            duplicate = None
-            if invoice_number:
+        if invoice_number:
+            with closing(sqlite3.connect(DB_PATH)) as connection:
                 vendor_gstin = invoice.get("vendor_gstin")
                 vendor_name = invoice.get("vendor_name")
                 invoice_date = invoice.get("invoice_date")
@@ -208,14 +213,10 @@ def process_invoice(
                            LIMIT 1""",
                         (invoice_number,),
                     ).fetchone()
-        performance["invoice_number_duplicate_check_seconds"] = round(
-            time.perf_counter() - duplicate_started, 4
-        )
+        performance["invoice_number_duplicate_check_seconds"] = round(time.perf_counter() - stage_started, 4)
         report("Invoice-number duplicate check", "Complete")
         if duplicate:
-            performance["total_processing_seconds"] = round(
-                time.perf_counter() - started, 4
-            )
+            performance["total_processing_seconds"] = round(time.perf_counter() - started, 4)
             performance["total_end_to_end_seconds"] = round(
                 performance["upload_seconds"] + performance["total_processing_seconds"], 4
             )
@@ -233,21 +234,23 @@ def process_invoice(
                 "slowest_stage": "Invoice-number duplicate check",
                 "stages": stages,
                 "auto_saved": False,
+                "enrichment_recommended": [],
             }
 
         report("Financial validation", "Processing")
-        validation_started = time.perf_counter()
-        validation = validate_invoice(invoice)
-        performance["financial_validation_seconds"] = round(
-            time.perf_counter() - validation_started, 4
+        stage_started = time.perf_counter()
+        validation = _apply_confidence_validation(
+            validate_invoice(invoice), invoice, confidence
         )
+        performance["financial_validation_seconds"] = round(time.perf_counter() - stage_started, 4)
         report("Financial validation", "Complete")
-
         processing_status = (
             "Processed" if validation["status"] == "Verified" else "Needs Attention"
         )
-        report("Database insertion", "Processing")
-        insertion_started = time.perf_counter()
+        enrichment_candidates = _enrichment_candidates(invoice, confidence)
+
+        report("Database save", "Processing")
+        stage_started = time.perf_counter()
         invoice_id = save_extracted_invoice(
             DB_PATH,
             invoice,
@@ -256,36 +259,46 @@ def process_invoice(
             json.dumps(invoice, ensure_ascii=False),
             processing_status=processing_status,
             source_hash=source_hash,
+            ocr_text=ocr["text"],
+            ocr_words=ocr.get("words", []),
+            field_evidence=evidence,
+            field_confidence=confidence,
+            item_evidence=evidence.get("items", []),
+            enrichment_status="queued" if enrichment_candidates else "not_needed",
         )
-        performance["database_insertion_seconds"] = round(
-            time.perf_counter() - insertion_started, 4
+        performance["database_save_seconds"] = round(time.perf_counter() - stage_started, 4)
+        report("Database save", "Complete")
+        performance["total_processing_seconds"] = round(time.perf_counter() - started, 4)
+        performance["total_end_to_end_seconds"] = round(
+            performance["upload_seconds"] + performance["total_processing_seconds"], 4
         )
-        report("Database insertion", "Complete")
+        timed_stages = {
+            "File validation": "file_validation_seconds",
+            "Duplicate detection": "duplicate_detection_seconds",
+            "PDF conversion": "pdf_conversion_seconds",
+            "OpenCV preprocessing": "preprocessing_seconds",
+            "Tesseract OCR": "ocr_seconds",
+            "Deterministic extraction": "deterministic_extraction_seconds",
+            "Financial validation": "financial_validation_seconds",
+            "Invoice-number duplicate check": "invoice_number_duplicate_check_seconds",
+            "Database save": "database_save_seconds",
+        }
+        slowest_stage = max(
+            timed_stages,
+            key=lambda stage: performance.get(timed_stages[stage], 0.0),
+        )
+        record_performance_metrics(
+            DB_PATH,
+            _metric_rows(performance),
+            invoice_id=invoice_id,
+            request_id=source_hash,
+        )
 
-    performance["total_processing_seconds"] = round(time.perf_counter() - started, 4)
-    performance["total_end_to_end_seconds"] = round(
-        performance["upload_seconds"] + performance["total_processing_seconds"], 4
-    )
-    timed_stages = {
-        "File validation": "file_validation_seconds",
-        "PDF conversion": "pdf_conversion_seconds",
-        "OpenCV preprocessing": "preprocessing_seconds",
-        "Tesseract OCR": "ocr_seconds",
-        "Mistral inference": "mistral_inference_seconds",
-        "Pydantic validation": "pydantic_validation_seconds",
-        "Financial validation": "financial_validation_seconds",
-        "File duplicate detection": "duplicate_detection_seconds",
-        "Invoice-number duplicate check": "invoice_number_duplicate_check_seconds",
-        "Database insertion": "database_insertion_seconds",
-    }
-    slowest_stage = max(
-        timed_stages,
-        key=lambda stage: performance.get(timed_stages[stage], 0.0),
-    )
     return {
         "invoice_id": invoice_id,
         "invoice": invoice,
         "evidence": evidence,
+        "field_confidence": confidence,
         "ocr": {
             "text": ocr["text"],
             "pages": ocr["pages"],
@@ -308,4 +321,5 @@ def process_invoice(
         "stages": stages,
         "auto_saved": True,
         "duplicate": False,
+        "enrichment_recommended": enrichment_candidates,
     }

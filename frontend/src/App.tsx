@@ -4,7 +4,7 @@ import { HashRouter, NavLink, Route, Routes, useNavigate } from 'react-router-do
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { BarChart3, Bot, ChevronRight, FileText, LayoutDashboard, Settings, UploadCloud, Wifi, WifiOff, Send, Trash2, Pencil, X, Check, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { api, downloadReport, setPairingToken } from './services/api'
+import { api, apiBaseUrl, downloadReport, setApiBaseUrl, setPairingToken } from './services/api'
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } } })
 
@@ -41,7 +41,17 @@ function Shell() {
     ['/settings', 'Settings', Settings],
   ] as const
   async function connect() {
-    const token = window.prompt('Enter the local pairing token printed by start_backend.ps1.')
+    if (!apiBaseUrl) {
+      const backendUrl = window.prompt('Enter the backend API URL (remote backends must use HTTPS).')
+      if (!backendUrl) return
+      try {
+        setApiBaseUrl(backendUrl)
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : 'The backend URL is invalid.')
+        return
+      }
+    }
+    const token = window.prompt('Enter the backend pairing token.')
     if (!token) return
     setPairingToken(token.trim())
     try {
@@ -176,13 +186,14 @@ function UploadPage() {
 
 function AnalysisResults({result}:{result:any}) {
   const metrics=result.performance||{}
-  const metricLabels:Record<string,string>={upload_seconds:'Upload storage (server)',client_upload_seconds:'Upload (browser)',file_validation_seconds:'File validation',pdf_conversion_seconds:'PDF conversion',preprocessing_seconds:'OpenCV preprocessing',ocr_seconds:'Tesseract OCR',mistral_inference_seconds:'AI inference',ollama_total_seconds:'Ollama total',ollama_load_seconds:'Ollama model load',ollama_prompt_eval_seconds:'Ollama prompt evaluation',ollama_generation_seconds:'Ollama generation',ollama_prompt_tokens:'Ollama prompt tokens',ollama_generated_tokens:'Ollama generated tokens',ollama_tokens_per_second:'Ollama generation speed',pydantic_validation_seconds:'Pydantic validation',financial_validation_seconds:'Financial validation',duplicate_detection_seconds:'File duplicate check',invoice_number_duplicate_check_seconds:'Invoice-number duplicate check',database_insertion_seconds:'Database insertion',total_processing_seconds:'Processing total',total_end_to_end_seconds:'End-to-end (server)',client_end_to_end_seconds:'End-to-end (browser)'}
+  const metricLabels:Record<string,string>={upload_seconds:'Upload storage (server)',client_upload_seconds:'Upload (browser)',file_validation_seconds:'File validation',pdf_conversion_seconds:'PDF conversion',preprocessing_seconds:'OpenCV preprocessing',ocr_seconds:'Tesseract OCR',deterministic_extraction_seconds:'Python field and line-item extraction',mistral_inference_seconds:'Optional AI enrichment',optional_ai_enrichment_seconds:'Optional AI enrichment',ollama_total_seconds:'Ollama total',ollama_load_seconds:'Ollama model load',ollama_prompt_eval_seconds:'Ollama prompt evaluation',ollama_generation_seconds:'Ollama generation',ollama_prompt_tokens:'Ollama prompt tokens',ollama_generated_tokens:'Ollama generated tokens',ollama_tokens_per_second:'Ollama generation speed',pydantic_validation_seconds:'Pydantic validation',financial_validation_seconds:'Financial validation',duplicate_detection_seconds:'File duplicate check',invoice_number_duplicate_check_seconds:'Invoice-number duplicate check',database_insertion_seconds:'Database insertion',database_save_seconds:'Database save',total_processing_seconds:'Processing total',total_end_to_end_seconds:'End-to-end (server)',client_end_to_end_seconds:'End-to-end (browser)'}
   return <section className="grid gap-6 rounded-2xl border border-slate-200 bg-white p-6 lg:grid-cols-2">
     <div><h2 className="mb-4 text-lg font-bold">OCR text</h2><pre className="max-h-96 overflow-auto rounded-lg bg-slate-950 p-4 text-xs whitespace-pre-wrap text-slate-200">{result.ocr?.text||'No OCR text was needed for this duplicate.'}</pre></div>
     <div>
       {result.ocr?.document?.warning&&<p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">{result.ocr.document.warning}</p>}
       <div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-bold">Automatic processing result</h2><span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold">{result.processing_status||result.validation?.status}</span></div>
       {result.duplicate?<p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">Duplicate invoice detected. No new record was added. Existing invoice: {result.invoice_id??'not found'}.</p>:<p className={`mb-4 rounded-lg p-3 text-sm ${result.processing_status==='Processed'?'bg-emerald-50 text-emerald-800':'bg-amber-50 text-amber-800'}`}>{result.processing_status==='Processed'?'Invoice validated and saved automatically.':`Saved to history as ${result.processing_status||'Needs Attention'}; it is excluded from financial totals.`} {result.invoice_id?`Invoice #${result.invoice_id}.`:''}</p>}
+      {result.enrichment_status&&result.enrichment_status!=='not_needed'&&<p className="mb-4 rounded-lg bg-blue-50 p-3 text-sm text-blue-800">Optional AI enrichment: {result.enrichment_status}. The invoice was saved before enrichment started.</p>}
       {result.invoice&&<dl className="grid gap-3 sm:grid-cols-2">{[['Invoice number',result.invoice.invoice_number],['Invoice date',result.invoice.invoice_date],['Vendor',result.invoice.vendor_name],['Vendor GSTIN',result.invoice.vendor_gstin],['Customer',result.invoice.customer_name],['Customer GSTIN',result.invoice.customer_gstin],['Subtotal',result.invoice.subtotal],['Tax',result.invoice.total_tax],['Grand total',result.invoice.grand_total]].map(([label,value])=><div key={label} className="rounded-lg bg-slate-50 p-3"><dt className="text-xs text-slate-500">{label}</dt><dd className="mt-1 break-words text-sm font-medium">{value??'Not extracted'}</dd></div>)}</dl>}
       {result.evidence&&<div className="mt-5"><h3 className="font-semibold">Extraction evidence</h3><div className="mt-2 space-y-2">{Object.entries(result.evidence).map(([field,value]:[string,any])=>Array.isArray(value)?<div key={field} className="space-y-2">{value.map((item:any)=><article key={item.item} className="rounded-lg border border-slate-200 p-3"><p className="text-xs font-semibold">Line item {item.item}</p><div className="mt-2 grid gap-2 sm:grid-cols-2">{Object.entries(item.fields).map(([name,evidence]:[string,any])=><p key={name} className="break-words text-xs"><span className="font-medium capitalize">{name.replaceAll('_',' ')} · {evidence.source}</span><span className="block text-slate-500">{evidence.line||'No supporting OCR text found'}</span></p>)}</div></article>)}</div>:<div key={field} className="rounded-lg border border-slate-200 px-3 py-2 text-sm"><div className="flex items-center justify-between gap-3"><span className="font-medium capitalize">{field.replaceAll('_',' ')}</span><span className="text-[10px] uppercase tracking-wide text-slate-400">{value.source}</span></div><span className="mt-1 block break-words text-xs text-slate-500">{value.line||'No supporting OCR text found'}</span></div>)}</div></div>}
       {[...(result.validation?.errors||[]),...(result.validation?.warnings||[]),...(result.validation?.missing_fields||[]).map((field:string)=>`Missing required field: ${field}`)].map((message:string)=><p key={message} className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">{message}</p>)}
@@ -244,7 +255,9 @@ function HistoryPage() {
         </form>:<dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[['Invoice date',details.data.invoice.invoice_date],['Vendor',details.data.invoice.vendor_name],['Subtotal',details.data.invoice.subtotal],['Tax',details.data.invoice.total_tax],['Grand total',details.data.invoice.grand_total],['Validation',details.data.invoice.validation_status],['Processing',details.data.invoice.processing_status]].map(([label,value])=><div key={label} className="rounded-xl bg-slate-50 p-3"><dt className="text-xs text-slate-500">{label}</dt><dd className="mt-1 break-words text-sm font-semibold">{value??'Not available'}</dd></div>)}</dl>}
         {correction.error&&<p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">{(correction.error as Error).message}</p>}
         {deletion.error&&<p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">{(deletion.error as Error).message}</p>}
-        <h3 className="mt-6 font-semibold">Line items</h3><div className="mt-2 space-y-2">{(details.data.items||[]).map((item:any,index:number)=><div key={item.id||index} className="flex justify-between gap-4 rounded-xl border border-slate-100 px-3 py-3 text-sm"><span>{item.description||'Unspecified item'} <span className="text-slate-500">· {item.category||'Other'}{item.discount_percent?` · ${item.discount_percent}% discount`:''}{item.discount?` · ₹${Number(item.discount).toLocaleString('en-IN')} discount`:''}</span></span><span className="font-medium">₹{Number(item.amount||0).toLocaleString('en-IN')}</span></div>)}{!details.data.items?.length&&<p className="text-sm text-slate-500">No line items were extracted.</p>}</div>
+        <h3 className="mt-6 font-semibold">Line items</h3><div className="mt-2 space-y-2">{(details.data.items||[]).map((item:any,index:number)=><div key={item.id||index} className="flex justify-between gap-4 rounded-xl border border-slate-100 px-3 py-3 text-sm"><span>{item.description||'Unspecified item'} <span className="text-slate-500">· {item.category||'Other'}{item.discount_percent?` · ${item.discount_percent}% discount`:''}{item.discount?` · ₹${Number(item.discount).toLocaleString('en-IN')} discount`:''}</span>{item.evidence?.fields?.description?.line&&<span className="mt-1 block text-xs text-slate-500">OCR: {item.evidence.fields.description.line} · confidence {Math.round((item.confidence||0)*100)}%</span>}</span><span className="font-medium">₹{Number(item.amount||0).toLocaleString('en-IN')}</span></div>)}{!details.data.items?.length&&<p className="text-sm text-slate-500">No line items were extracted.</p>}</div>
+        <section className="mt-6 rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Optional AI enrichment</h3><p className="mt-1 text-sm text-slate-600">Status: {details.data.invoice.enrichment_status||'not available'}</p>{details.data.invoice.enrichment_error&&<p className="mt-2 text-sm text-amber-800">{details.data.invoice.enrichment_error}</p>}{Object.keys(details.data.invoice.enrichment||{}).length>0&&<pre className="mt-3 overflow-auto rounded-lg bg-slate-50 p-3 text-xs whitespace-pre-wrap">{JSON.stringify(details.data.invoice.enrichment,null,2)}</pre>}</section>
+        <details className="mt-4 rounded-xl border border-slate-200 p-4"><summary className="cursor-pointer text-sm font-semibold">OCR text and field evidence</summary><pre className="mt-3 max-h-80 overflow-auto rounded-lg bg-slate-950 p-3 text-xs whitespace-pre-wrap text-slate-100">{details.data.invoice.ocr_text||'No OCR text was retained for this legacy record.'}</pre><div className="mt-3 space-y-2">{Object.entries(details.data.invoice.field_evidence||{}).filter(([field])=>field!=='items').map(([field,evidence]:[string,any])=><p key={field} className="rounded-lg bg-slate-50 p-2 text-xs"><span className="font-semibold capitalize">{field.replaceAll('_',' ')} · {Math.round((details.data.invoice.field_confidence?.[field]||0)*100)}%</span><span className="block text-slate-500">{evidence.line||'No direct OCR evidence'}</span></p>)}</div></details>
       </div>}
     </section>}
   </div>
@@ -264,7 +277,8 @@ type ChatMessage = {
   role: 'user' | 'assistant'
   content: string
   rows?: Record<string, unknown>[]
-  context?: Record<string, string>
+  details?: Record<string, unknown>[]
+  context?: Record<string, unknown>
 }
 
 function assistantCell(key: string, value: unknown): string {
@@ -299,7 +313,8 @@ function AssistantPage() {
       setHistory(items => [...items, {
         role: 'assistant',
         content: result.answer || 'No answer was returned.',
-        rows: result.rows || [],
+        rows: result.supporting_invoices || result.rows || [],
+        details: result.calculation?.line_items || [],
         context: result.context || {},
       }])
       setFailedQuestion('')
@@ -336,6 +351,7 @@ function AssistantPage() {
           <div className={`max-w-[92%] rounded-2xl px-4 py-3 sm:max-w-[82%] ${message.role==='user'?'rounded-br-md bg-[#202b46] text-white':'rounded-bl-md border border-slate-200 bg-white text-slate-800 shadow-sm'}`}>
             <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>
             {!!message.rows?.length&&<div className="mt-3 max-w-full overflow-x-auto rounded-lg border border-slate-200"><table className="min-w-full text-left text-xs"><thead className="bg-slate-50 text-slate-500"><tr>{Object.keys(message.rows[0]).map(key=><th key={key} className="whitespace-nowrap px-3 py-2 font-semibold">{key.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{message.rows.slice(0,20).map((row,rowIndex)=><tr key={rowIndex} className="border-t border-slate-100">{Object.entries(message.rows?.[0]||{}).map(([key])=><td key={key} className="whitespace-nowrap px-3 py-2">{assistantCell(key,row[key])}</td>)}</tr>)}</tbody></table></div>}
+            {!!message.details?.length&&<div className="mt-3 max-w-full overflow-x-auto rounded-lg border border-slate-200"><p className="bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">Stored line items</p><table className="min-w-full text-left text-xs"><thead className="bg-slate-50 text-slate-500"><tr>{Object.keys(message.details[0]).map(key=><th key={key} className="whitespace-nowrap px-3 py-2 font-semibold">{key.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{message.details.slice(0,20).map((row,rowIndex)=><tr key={rowIndex} className="border-t border-slate-100">{Object.entries(message.details?.[0]||{}).map(([key])=><td key={key} className="whitespace-nowrap px-3 py-2">{assistantCell(key,row[key])}</td>)}</tr>)}</tbody></table></div>}
           </div>
           {message.role==='user'&&<span className="mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-slate-200 text-slate-600"><FileText size={16}/></span>}
         </article>)}
@@ -372,8 +388,8 @@ function SettingsPage() {
     ['Context window',ollama.context_window||'Unknown'],['LayoutLMv3',data.layoutlm],
   ]
   return <div className="space-y-6"><PageHeader title="System settings" subtitle="Local services, model readiness, and detected hardware"/>
-    {!ollama.reachable&&<p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">Ollama is not reachable. Start Ollama locally. Invoice processing requires the selected model to be installed; the app will not download models automatically.{ollama.error?` ${ollama.error}`:''}</p>}
-    {ollama.reachable&&!ollama.selected_model_available&&<p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">Install the configured model with <code>ollama pull {ollama.selected_model}</code>. Optional accuracy profile: <code>qwen2.5:3b</code>.</p>}
+    {!ollama.reachable&&<p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">Ollama is unavailable. Invoice OCR, deterministic extraction, validation, and saving continue without it; optional enrichment is paused.{ollama.error?` ${ollama.error}`:''}</p>}
+    {ollama.reachable&&!ollama.selected_model_available&&<p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">The configured model is optional. Install it with <code>ollama pull {ollama.selected_model}</code> to enable background enrichment. No model is downloaded automatically.</p>}
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{cards.map(([label,value])=><article key={label} className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm"><p className="text-xs font-medium text-slate-500">{label}</p><p className="mt-2 break-words text-sm font-semibold text-slate-900">{value||'Unknown'}</p></article>)}</div>
   </div>
 }

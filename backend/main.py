@@ -19,16 +19,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-from config import DB_PATH, LAYOUTLM_MODEL
+from config import (
+    APP_ENV,
+    DB_PATH,
+    INVOICE_DATA_DIR,
+    LAYOUTLM_MODEL,
+    MAX_UPLOAD_BYTES,
+)
 from backend.database.database import (
     initialize_database,
     get_dashboard_data,
     get_invoice_details,
     load_processing_jobs,
+    record_performance_metrics,
     save_processing_job,
+    update_invoice_enrichment,
 )
 from backend.services.invoice_pipeline import process_invoice, InvoiceProcessingError
-from backend.llm.mistral_service import ollama_status
+from backend.llm.mistral_service import ollama_status, suggest_invoice_enrichment
 from backend.ocr.ocr_service import check_tesseract, validate_document_file
 from backend.services.chat_assistant import answer_question
 from backend.models.invoice import InvoiceData
@@ -36,11 +44,12 @@ from backend.validation.validation_engine import validate_invoice
 
 
 PAIRING_TOKEN = os.getenv("LOCAL_API_TOKEN", "")
-DATA_DIR = Path(os.getenv("INVOICE_DATA_DIR", "data/input"))
+DATA_DIR = INVOICE_DATA_DIR
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 initialize_database(DB_PATH)
 logger = logging.getLogger(__name__)
 _processing_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="invoice-processing")
+_enrichment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="invoice-ai-enrichment")
 _processing_jobs: dict[str, dict] = {}
 _active_upload_jobs: dict[str, str] = {}
 _active_upload_hashes: dict[str, str] = {}
@@ -70,14 +79,19 @@ async def lifespan(_app):
         yield
     finally:
         _processing_executor.shutdown(wait=False, cancel_futures=True)
+        _enrichment_executor.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(title="Invoice Intelligence API", version="1.0.0", lifespan=lifespan)
-frontend_origins = {
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "https://arbatsarthak-commits.github.io",
-}
+frontend_origins = set()
+if APP_ENV != "production":
+    frontend_origins.update(
+        {
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "https://arbatsarthak-commits.github.io",
+        }
+    )
 frontend_origins.update(
     origin.strip()
     for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
@@ -140,6 +154,11 @@ def system_status(x_pairing_token: Optional[str] = Header(default=None)):
     return {
         "backend": "available",
         "database": "available" if DB_PATH.exists() else "missing",
+        "database_backend": "sqlite",
+        "environment": APP_ENV,
+        "file_storage_backend": "filesystem",
+        "file_storage_path_configured": DATA_DIR.is_dir(),
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
         "ocr": ocr_status,
         "tesseract_version": tesseract_version,
         "ollama": ollama,
@@ -169,8 +188,12 @@ async def upload_invoice(request: Request, file: UploadFile = File(...),
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > 20 * 1024 * 1024:
-                    raise HTTPException(status_code=413, detail="The file exceeds the 20 MB limit.")
+                if size > MAX_UPLOAD_BYTES:
+                    maximum_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"The file exceeds the {maximum_mb} MB limit.",
+                    )
                 output.write(chunk)
     except Exception:
         destination.unlink(missing_ok=True)
@@ -301,6 +324,25 @@ def _run_processing_job(job_id: str, upload_id: str, path: Path, upload_seconds:
         result = process_invoice(
             path, stage_callback=update_stage, upload_seconds=upload_seconds
         )
+        if result.get("enrichment_recommended") and result.get("invoice_id"):
+            result["enrichment_status"] = "queued"
+            try:
+                _enrichment_executor.submit(
+                    _run_optional_enrichment,
+                    result["invoice_id"],
+                    result.get("ocr", {}).get("text", ""),
+                    result["enrichment_recommended"],
+                )
+            except RuntimeError as exc:
+                logger.warning("Could not queue optional AI enrichment: %s", exc)
+                update_invoice_enrichment(
+                    DB_PATH,
+                    result["invoice_id"],
+                    status="unavailable",
+                    error=str(exc),
+                )
+        else:
+            result["enrichment_status"] = "not_needed"
         with _processing_jobs_lock:
             _processing_jobs[job_id].update(
                 status="complete", current_stage="Complete", result=result,
@@ -342,6 +384,46 @@ def _run_processing_job(job_id: str, upload_id: str, path: Path, upload_seconds:
             for source_hash, active_job in list(_active_upload_hashes.items()):
                 if active_job == job_id:
                     _active_upload_hashes.pop(source_hash, None)
+
+
+def _run_optional_enrichment(
+    invoice_id: int, raw_text: str, requested_fields: list[str]
+) -> None:
+    started = time.perf_counter()
+    status = "complete"
+    details = {}
+    try:
+        suggestions, model_metrics = suggest_invoice_enrichment(raw_text, requested_fields)
+        status = "complete" if suggestions else "no_suggestions"
+        details = model_metrics
+        update_invoice_enrichment(
+            DB_PATH,
+            invoice_id,
+            status=status,
+            suggestions=suggestions,
+        )
+    except Exception as exc:
+        status = "unavailable" if "not installed" in str(exc).lower() or "cannot reach ollama" in str(exc).lower() else "failed"
+        logger.warning("Optional AI enrichment failed for invoice %s: %s", invoice_id, exc)
+        try:
+            update_invoice_enrichment(DB_PATH, invoice_id, status=status, error=str(exc))
+        except Exception:
+            logger.exception("Could not persist AI enrichment failure for invoice %s", invoice_id)
+    finally:
+        try:
+            record_performance_metrics(
+                DB_PATH,
+                [{
+                    "stage": "optional_ai_enrichment",
+                    "duration_seconds": time.perf_counter() - started,
+                    "status": status,
+                    "details": details,
+                }],
+                invoice_id=invoice_id,
+                request_id=f"enrichment-{invoice_id}",
+            )
+        except Exception:
+            logger.exception("Could not persist AI enrichment timings for invoice %s", invoice_id)
 
 
 @app.get("/api/processing/{job_id}")
@@ -538,9 +620,20 @@ def assistant_query(payload: dict, request: Request,
             "role": entry.get("role"),
             "content": str(entry.get("content", ""))[:1000],
             "context": {
-                key: value[:120]
-                for key, value in entry.get("context", {}).items()
-                if key in {"vendor", "category"} and isinstance(value, str)
+                **{
+                    key: value[:120]
+                    for key, value in entry.get("context", {}).items()
+                    if key in {"vendor", "category", "invoice_number"}
+                    and isinstance(value, str)
+                },
+                **(
+                    {"invoice_id": entry["context"]["invoice_id"]}
+                    if isinstance(entry.get("context"), dict)
+                    and isinstance(entry["context"].get("invoice_id"), int)
+                    and not isinstance(entry["context"]["invoice_id"], bool)
+                    and entry["context"]["invoice_id"] > 0
+                    else {}
+                ),
             } if isinstance(entry.get("context"), dict) else {},
         }
         for entry in history[-8:]

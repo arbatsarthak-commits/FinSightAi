@@ -81,7 +81,7 @@ class InvoiceData(BaseModel):
     igst: Optional[float] = None
     total_tax: Optional[float] = None
     grand_total: Optional[float] = None
-    currency: str = "INR"
+    currency: Optional[str] = None
     payment_status: Optional[str] = None
 
     @field_validator("invoice_date", "due_date", mode="before")

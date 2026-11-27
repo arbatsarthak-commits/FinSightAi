@@ -26,7 +26,7 @@ def deskew(gray: np.ndarray) -> np.ndarray:
                           borderMode=cv2.BORDER_REPLICATE)
 
 
-def preprocess_image(image_path: str | Path) -> np.ndarray:
+def preprocess_image(image_path: str | Path, adaptive: bool = False) -> np.ndarray:
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError("The image could not be read or is corrupted.")
@@ -38,5 +38,9 @@ def preprocess_image(image_path: str | Path) -> np.ndarray:
     if float(gray.std()) < 45:
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     gray = deskew(gray)
+    if adaptive:
+        return cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 12
+        )
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return otsu

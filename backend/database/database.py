@@ -31,7 +31,14 @@ CREATE TABLE IF NOT EXISTS invoices (
     extracted_data TEXT,
     corrected_data TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    ocr_text TEXT,
+    ocr_words_json TEXT,
+    field_evidence_json TEXT,
+    field_confidence_json TEXT,
+    enrichment_status TEXT DEFAULT 'not_needed',
+    enrichment_suggestions TEXT,
+    enrichment_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_invoices_number ON invoices(invoice_number);
 CREATE INDEX IF NOT EXISTS idx_invoices_number_normalized ON invoices(lower(trim(invoice_number)));
@@ -39,6 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_invoices_vendor ON invoices(vendor_name);
 CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
 CREATE INDEX IF NOT EXISTS idx_invoices_validation ON invoices(validation_status);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_invoices_source_hash ON invoices(source_hash);
+CREATE INDEX IF NOT EXISTS idx_invoices_vendor_normalized ON invoices(lower(trim(vendor_name)));
 
 CREATE TABLE IF NOT EXISTS invoice_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,10 +62,14 @@ CREATE TABLE IF NOT EXISTS invoice_items (
     igst REAL,
     amount REAL,
     category TEXT,
+    evidence_json TEXT,
+    confidence REAL,
     FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_invoice_items_category ON invoice_items(category);
+CREATE INDEX IF NOT EXISTS idx_invoice_items_category_normalized ON invoice_items(lower(trim(category)));
+CREATE INDEX IF NOT EXISTS idx_invoice_items_description ON invoice_items(description COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS expense_categories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +98,20 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS performance_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT,
+    invoice_id INTEGER,
+    stage TEXT NOT NULL,
+    duration_seconds REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'complete',
+    details_json TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_performance_metrics_invoice ON performance_metrics(invoice_id, stage);
+CREATE INDEX IF NOT EXISTS idx_performance_metrics_request ON performance_metrics(request_id, stage);
 """
 
 
@@ -115,6 +141,20 @@ def initialize_database(db_path: str | Path) -> None:
                            ELSE 'Needs Attention'
                        END"""
                 )
+            invoice_columns = {
+                "ocr_text": "TEXT",
+                "ocr_words_json": "TEXT",
+                "field_evidence_json": "TEXT",
+                "field_confidence_json": "TEXT",
+                "enrichment_status": "TEXT DEFAULT 'not_needed'",
+                "enrichment_suggestions": "TEXT",
+                "enrichment_error": "TEXT",
+            }
+            for name, definition in invoice_columns.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE invoices ADD COLUMN {name} {definition}"
+                    )
         item_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='invoice_items'"
         ).fetchone()
@@ -125,6 +165,14 @@ def initialize_database(db_path: str | Path) -> None:
             if "discount_percent" not in item_columns:
                 connection.execute(
                     "ALTER TABLE invoice_items ADD COLUMN discount_percent REAL"
+                )
+            if "evidence_json" not in item_columns:
+                connection.execute(
+                    "ALTER TABLE invoice_items ADD COLUMN evidence_json TEXT"
+                )
+            if "confidence" not in item_columns:
+                connection.execute(
+                    "ALTER TABLE invoice_items ADD COLUMN confidence REAL"
                 )
         connection.executescript(SCHEMA)
         connection.execute(
@@ -159,7 +207,13 @@ def db_connection(db_path: str | Path):
 def save_extracted_invoice(db_path: str | Path, invoice: dict, source_file: str,
                            validation: dict, extracted_json: str,
                            processing_status: str | None = None,
-                           source_hash: str | None = None) -> int:
+                           source_hash: str | None = None, *,
+                           ocr_text: str | None = None,
+                           ocr_words: list[dict] | None = None,
+                           field_evidence: dict | None = None,
+                           field_confidence: dict | None = None,
+                           item_evidence: list[dict] | None = None,
+                           enrichment_status: str = "not_needed") -> int:
     if processing_status is None:
         processing_status = (
             "Processed" if validation.get("status") == "Verified" else "Needs Attention"
@@ -171,9 +225,10 @@ def save_extracted_invoice(db_path: str | Path, invoice: dict, source_file: str,
                 invoice_number, invoice_date, due_date, vendor_name, vendor_gstin,
                 customer_name, customer_gstin, subtotal, cgst, sgst, igst, total_tax,
                 grand_total, currency, payment_status, source_file, source_hash, extraction_status,
-                validation_status, approval_status, processing_status, extracted_data, corrected_data
+                validation_status, approval_status, processing_status, extracted_data, corrected_data,
+                ocr_text, ocr_words_json, field_evidence_json, field_confidence_json, enrichment_status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Extracted',
-                ?, 'Automatic', ?, ?, ?)
+                ?, 'Automatic', ?, ?, NULL, ?, ?, ?, ?, ?)
             """,
             (
                 invoice.get("invoice_number"), invoice.get("invoice_date"), invoice.get("due_date"),
@@ -183,17 +238,22 @@ def save_extracted_invoice(db_path: str | Path, invoice: dict, source_file: str,
                 invoice.get("igst"), invoice.get("total_tax"), invoice.get("grand_total"),
                 invoice.get("currency", "INR"), invoice.get("payment_status"), source_file, source_hash,
                 validation["status"], processing_status, extracted_json,
-                json.dumps(invoice, ensure_ascii=False),
+                ocr_text,
+                json.dumps(ocr_words or [], ensure_ascii=False),
+                json.dumps(field_evidence or {}, ensure_ascii=False),
+                json.dumps(field_confidence or {}, ensure_ascii=False),
+                enrichment_status,
             ),
         )
         invoice_id = cursor.lastrowid
-        for item in invoice.get("items", []):
+        for index, item in enumerate(invoice.get("items", [])):
+            evidence = item_evidence[index] if item_evidence and index < len(item_evidence) else {}
             connection.execute(
                 """
                 INSERT INTO invoice_items (
                     invoice_id, description, quantity, unit_price, discount, discount_percent,
-                    taxable_value, cgst, sgst, igst, amount, category
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    taxable_value, cgst, sgst, igst, amount, category, evidence_json, confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     invoice_id, item.get("description"), item.get("quantity"),
@@ -201,6 +261,7 @@ def save_extracted_invoice(db_path: str | Path, invoice: dict, source_file: str,
                     item.get("taxable_value"),
                     item.get("cgst"), item.get("sgst"), item.get("igst"),
                     item.get("amount"), item.get("category", "Other"),
+                    json.dumps(evidence, ensure_ascii=False), evidence.get("confidence"),
                 ),
             )
         connection.execute(
@@ -208,6 +269,57 @@ def save_extracted_invoice(db_path: str | Path, invoice: dict, source_file: str,
             (invoice_id,),
         )
         return invoice_id
+
+
+def record_performance_metrics(
+    db_path: str | Path,
+    metrics: list[dict],
+    *,
+    invoice_id: int | None = None,
+    request_id: str | None = None,
+) -> None:
+    if not metrics:
+        return
+    with db_connection(db_path) as connection:
+        connection.executemany(
+            """INSERT INTO performance_metrics
+               (request_id, invoice_id, stage, duration_seconds, status, details_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    request_id,
+                    invoice_id,
+                    metric["stage"],
+                    max(0.0, float(metric["duration_seconds"])),
+                    metric.get("status", "complete"),
+                    json.dumps(metric.get("details", {}), ensure_ascii=False),
+                )
+                for metric in metrics
+            ],
+        )
+
+
+def update_invoice_enrichment(
+    db_path: str | Path,
+    invoice_id: int,
+    *,
+    status: str,
+    suggestions: dict | None = None,
+    error: str | None = None,
+) -> None:
+    with db_connection(db_path) as connection:
+        connection.execute(
+            """UPDATE invoices
+               SET enrichment_status = ?, enrichment_suggestions = ?, enrichment_error = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (
+                status,
+                json.dumps(suggestions, ensure_ascii=False) if suggestions is not None else None,
+                error,
+                invoice_id,
+            ),
+        )
 
 
 def get_dashboard_data(db_path: str | Path) -> dict:
@@ -225,7 +337,8 @@ def get_dashboard_data(db_path: str | Path) -> dict:
         ).fetchone()
         categories = connection.execute(
             """
-            SELECT COALESCE(category, 'Other') AS category, COALESCE(SUM(amount), 0) AS amount
+            SELECT COALESCE(category, 'Other') AS category,
+                   COALESCE(SUM(COALESCE(taxable_value, amount, 0)), 0) AS amount
             FROM invoice_items i
             JOIN invoices n ON n.id = i.invoice_id
             WHERE n.validation_status = 'Verified'
@@ -272,6 +385,18 @@ def get_invoice_details(db_path: str | Path, invoice_id: int) -> dict:
         ).fetchone()
         if invoice is None:
             return {}
+        invoice_data = dict(invoice)
+        for column, field in (
+            ("field_evidence_json", "field_evidence"),
+            ("field_confidence_json", "field_confidence"),
+            ("enrichment_suggestions", "enrichment"),
+        ):
+            try:
+                invoice_data[field] = json.loads(invoice_data.get(column) or "{}")
+            except json.JSONDecodeError:
+                invoice_data[field] = {}
+            invoice_data.pop(column, None)
+        invoice_data.pop("ocr_words_json", None)
         items = connection.execute(
             "SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id",
             (invoice_id,),
@@ -280,9 +405,15 @@ def get_invoice_details(db_path: str | Path, invoice_id: int) -> dict:
             "SELECT * FROM processing_logs WHERE invoice_id = ? ORDER BY id",
             (invoice_id,),
         ).fetchall()
+        item_rows = [dict(row) for row in items]
+        for item in item_rows:
+            try:
+                item["evidence"] = json.loads(item.pop("evidence_json", None) or "{}")
+            except json.JSONDecodeError:
+                item["evidence"] = {}
         return {
-            "invoice": dict(invoice),
-            "items": [dict(row) for row in items],
+            "invoice": invoice_data,
+            "items": item_rows,
             "logs": [dict(row) for row in logs],
         }
 

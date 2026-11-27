@@ -1,25 +1,32 @@
-const configuredUrl = import.meta.env.VITE_API_BASE_URL as string | undefined
+const configuredUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim()
 
-export const apiBaseUrl = (configuredUrl || 'http://127.0.0.1:8000').replace(/\/$/, '')
+export let apiBaseUrl = (configuredUrl || '').replace(/\/$/, '')
 let pairingToken = ''
+
+export function setApiBaseUrl(value: string): void {
+  const parsed = new URL(value.trim())
+  const localHosts = new Set(['localhost', '127.0.0.1', '[::1]'])
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && localHosts.has(parsed.hostname))) {
+    throw new Error('Remote backends must use HTTPS. HTTP is allowed only for a local loopback backend.')
+  }
+  apiBaseUrl = parsed.toString().replace(/\/$/, '')
+}
+
+if (configuredUrl) setApiBaseUrl(configuredUrl)
 
 export function setPairingToken(token: string): void {
   pairingToken = token
 }
 
 function connectionError(): Error {
-  const hosted = window.location.hostname.endsWith('github.io')
-  if (hosted) {
-    return new Error(
-      'Could not reach the local backend. Start FastAPI at http://127.0.0.1:8000, allow local-network access for this GitHub Pages site in your browser, and check the pairing token.'
-    )
-  }
   return new Error(
-    'Could not reach the backend at ' + apiBaseUrl + '. Start FastAPI and confirm it is listening on this address.'
+    'Could not reach the backend at ' + apiBaseUrl +
+    '. Confirm the configured API URL is reachable and the backend is listening.'
   )
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  if (!apiBaseUrl) throw new Error('Configure VITE_API_BASE_URL or enter a backend URL when connecting.')
   const headers = new Headers(options.headers)
   if (pairingToken) headers.set('X-Pairing-Token', pairingToken)
   let response: Response
@@ -43,6 +50,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 }
 
 export async function downloadReport(): Promise<void> {
+  if (!apiBaseUrl) throw new Error('Configure VITE_API_BASE_URL or enter a backend URL when connecting.')
   const headers = new Headers()
   headers.set('X-Pairing-Token', pairingToken)
   let response: Response
