@@ -86,7 +86,97 @@ def test_item_amounts_mismatching_subtotal_and_grand_total_fail_reconciliation()
     result = validate_invoice(invoice)
 
     assert result["status"] == "Validation Failed"
-    assert any("item taxable amounts sum" in error for error in result["errors"])
+    assert any("line-item amounts" in error for error in result["errors"])
+
+
+def test_missing_gst_components_are_not_assumed_to_be_zero():
+    result = validate_invoice({
+        "invoice_number": "INV-MISSING-GST",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 100,
+        "total_tax": 18,
+        "grand_total": 118,
+    })
+
+    assert result["status"] == "Needs Attention"
+    assert any("Tax components are missing" in warning for warning in result["warnings"])
+    assert not any("CGST + SGST + IGST" in error for error in result["errors"])
+
+
+def test_partial_gst_components_are_not_reconciled_as_complete():
+    result = validate_invoice({
+        "invoice_number": "INV-PARTIAL-GST",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 100,
+        "cgst": 9,
+        "total_tax": 9,
+        "grand_total": 109,
+    })
+
+    assert result["status"] == "Needs Attention"
+    assert any("breakdown is incomplete" in warning for warning in result["warnings"])
+    assert not any("CGST + SGST + IGST" in error for error in result["errors"])
+
+
+def test_recorded_round_off_reconciles_grand_total():
+    invoice = {
+        "invoice_number": "INV-ROUND-OFF",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 100,
+        "cgst": 9,
+        "sgst": 9,
+        "igst": 0,
+        "total_tax": 18,
+        "round_off": -0.01,
+        "grand_total": 117.99,
+    }
+
+    assert validate_invoice(invoice)["status"] == "Verified"
+
+
+def test_small_unrecorded_round_off_requires_attention_not_failure():
+    result = validate_invoice({
+        "invoice_number": "INV-UNRECORDED-ROUND-OFF",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 100,
+        "cgst": 9,
+        "sgst": 9,
+        "igst": 0,
+        "total_tax": 18,
+        "grand_total": 117.99,
+    })
+
+    assert result["status"] == "Needs Attention"
+    assert not result["errors"]
+    assert any("round-off value was not extracted" in warning for warning in result["warnings"])
+
+
+def test_fractional_quantity_is_not_rounded_as_currency():
+    result = validate_invoice({
+        "invoice_number": "INV-FRACTIONAL-QUANTITY",
+        "invoice_date": "2026-11-22",
+        "vendor_name": "Example",
+        "subtotal": 10,
+        "cgst": 0,
+        "sgst": 0,
+        "igst": 0,
+        "total_tax": 0,
+        "grand_total": 10,
+        "tax_inclusive": True,
+        "items": [{
+            "description": "Fractional item",
+            "quantity": 0.125,
+            "unit_price": 80,
+            "amount": 10,
+            "amount_basis": "taxable",
+        }],
+    })
+
+    assert result["status"] == "Verified"
 
 
 def test_missing_subtotal_and_line_items_needs_attention():

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,6 +17,7 @@ class InvoiceItem(BaseModel):
     sgst: Optional[float] = None
     igst: Optional[float] = None
     amount: Optional[float] = None
+    amount_basis: Optional[Literal["taxable", "gross", "unknown"]] = None
     category: str = "Other"
 
     @model_validator(mode="before")
@@ -68,6 +69,8 @@ class InvoiceData(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     invoice_number: Optional[str] = None
+    order_number: Optional[str] = None
+    pack_number: Optional[str] = None
     invoice_date: Optional[str] = None
     due_date: Optional[str] = None
     vendor_name: Optional[str] = None
@@ -80,7 +83,9 @@ class InvoiceData(BaseModel):
     sgst: Optional[float] = None
     igst: Optional[float] = None
     total_tax: Optional[float] = None
+    round_off: Optional[float] = None
     grand_total: Optional[float] = None
+    tax_inclusive: Optional[bool] = None
     currency: Optional[str] = None
     payment_status: Optional[str] = None
 
@@ -89,7 +94,11 @@ class InvoiceData(BaseModel):
     def normalize_date(cls, value):
         if not isinstance(value, str) or not value.strip():
             return value
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+        for fmt in (
+            "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+            "%m/%d/%Y", "%d-%m-%y", "%d/%m/%y",
+            "%d %b %Y", "%d %B %Y", "%d %b %y", "%d %B %y",
+        ):
             try:
                 return datetime.strptime(value.strip(), fmt).date().isoformat()
             except ValueError:
@@ -97,7 +106,7 @@ class InvoiceData(BaseModel):
         return value
 
     @field_validator(
-        "subtotal", "cgst", "sgst", "igst", "total_tax", "grand_total",
+        "subtotal", "cgst", "sgst", "igst", "total_tax", "round_off", "grand_total",
     )
     @classmethod
     def totals_must_be_finite(cls, value):

@@ -60,6 +60,13 @@ def _install_pipeline_fakes(monkeypatch, invoice=None, confidence=None):
             "invoice": extracted.model_dump(),
             "evidence": {
                 "invoice_number": {"source": "tesseract", "line": "Invoice No: INV-PIPELINE"},
+                "vendor_name": {
+                    "source": "tesseract",
+                    "line": "Test vendor",
+                    "ocr_confidence": 0.44,
+                    "pattern_reliability": 0.95,
+                    "extraction_method": "layout heuristic",
+                },
                 "items": [{
                     "item": 1,
                     "fields": {"description": {"source": "tesseract", "line": "Service"}},
@@ -115,6 +122,10 @@ def test_low_confidence_fields_are_saved_as_needs_attention(tmp_path, monkeypatc
     assert result["processing_status"] == "Needs Attention"
     assert result["validation"]["status"] == "Needs Attention"
     assert any("vendor name" in warning for warning in result["validation"]["warnings"])
+    reason = result["validation"]["confidence_reasons"]["vendor_name"]
+    assert reason["required_threshold"] == 0.8
+    assert reason["method"] == "layout heuristic"
+    assert reason["evidence"] == "Test vendor"
     details = get_invoice_details(invoice_pipeline.DB_PATH, result["invoice_id"])
     assert details["invoice"]["enrichment_status"] == "queued"
 

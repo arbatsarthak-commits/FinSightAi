@@ -23,8 +23,13 @@ class InvoiceProcessingError(RuntimeError):
 
 
 _processing_lock = threading.Lock()
-_REQUIRED_CONFIDENCE = 0.75
 _REQUIRED_FIELDS = ("invoice_number", "invoice_date", "vendor_name", "grand_total")
+_REQUIRED_CONFIDENCE = {
+    "invoice_number": 0.78,
+    "invoice_date": 0.80,
+    "vendor_name": 0.80,
+    "grand_total": 0.85,
+}
 
 
 def file_sha256(path: str | Path) -> str:
@@ -38,7 +43,8 @@ def file_sha256(path: str | Path) -> str:
 def _enrichment_candidates(invoice: dict, confidence: dict[str, float]) -> list[str]:
     candidates = [
         field for field in _REQUIRED_FIELDS
-        if not invoice.get(field) or confidence.get(field, 0.0) < _REQUIRED_CONFIDENCE
+        if not invoice.get(field)
+        or confidence.get(field, 0.0) < _REQUIRED_CONFIDENCE[field]
     ]
     if not invoice.get("items"):
         candidates.append("line_items")
@@ -48,19 +54,39 @@ def _enrichment_candidates(invoice: dict, confidence: dict[str, float]) -> list[
 
 
 def _apply_confidence_validation(
-    validation: dict, invoice: dict, confidence: dict[str, float]
+    validation: dict,
+    invoice: dict,
+    confidence: dict[str, float],
+    evidence: dict[str, Any] | None = None,
 ) -> dict:
     validation = {
         **validation,
         "warnings": list(validation.get("warnings", [])),
         "missing_fields": list(validation.get("missing_fields", [])),
     }
+    confidence_reasons = {}
     for field in _REQUIRED_FIELDS:
         value = invoice.get(field)
-        if value and confidence.get(field, 0.0) < _REQUIRED_CONFIDENCE:
+        field_confidence = confidence.get(field, 0.0)
+        threshold = _REQUIRED_CONFIDENCE[field]
+        if value and field_confidence < threshold:
+            field_evidence = (evidence or {}).get(field, {})
+            method = field_evidence.get("extraction_method", "unknown")
+            ocr_confidence = field_evidence.get("ocr_confidence", field_evidence.get("confidence", 0.0))
+            reliability = field_evidence.get("pattern_reliability")
+            confidence_reasons[field] = {
+                "confidence": field_confidence,
+                "required_threshold": threshold,
+                "method": method,
+                "ocr_confidence": ocr_confidence,
+                "pattern_reliability": reliability,
+                "evidence": field_evidence.get("line"),
+            }
             validation["warnings"].append(
-                f"OCR confidence for {field.replace('_', ' ')} is below the review threshold."
+                f"Confidence for {field.replace('_', ' ')} is {field_confidence:.2f} "
+                f"from {method} (review threshold {threshold:.2f})."
             )
+    validation["confidence_reasons"] = confidence_reasons
     if not invoice.get("items"):
         validation["warnings"].append(
             "No invoice line items were detected; review line-item extraction."
@@ -240,7 +266,7 @@ def process_invoice(
         report("Financial validation", "Processing")
         stage_started = time.perf_counter()
         validation = _apply_confidence_validation(
-            validate_invoice(invoice), invoice, confidence
+            validate_invoice(invoice), invoice, confidence, evidence
         )
         performance["financial_validation_seconds"] = round(time.perf_counter() - stage_started, 4)
         report("Financial validation", "Complete")

@@ -336,6 +336,113 @@ def _supporting_invoices(
     return invoices, int(count_rows[0]["count"])
 
 
+def _provisional_spend_summary(
+    db_path: str | Path,
+    scope_filter: str,
+    parameters: tuple,
+    timings: dict[str, float],
+) -> tuple[dict, list[dict]]:
+    provisional = "(validation_status IS NULL OR validation_status != 'Verified')"
+    rows = _rows(
+        db_path,
+        f"""SELECT COUNT(*) AS invoice_count,
+                   COUNT(grand_total) AS priced_invoice_count,
+                   COUNT(*) - COUNT(grand_total) AS missing_total_count,
+                   SUM(grand_total) AS total
+            FROM invoices
+            WHERE {provisional} AND ({scope_filter})""",
+        parameters,
+        timings,
+    )
+    invoices, _ = _supporting_invoices(
+        db_path, f"{provisional} AND ({scope_filter})", parameters, timings
+    )
+    return rows[0], invoices
+
+
+def _provisional_spend_note(summary: dict) -> str:
+    if not summary["invoice_count"]:
+        return ""
+    count = summary["invoice_count"]
+    missing = summary["missing_total_count"]
+    if summary["priced_invoice_count"]:
+        note = (
+            f" Provisional invoices, excluded from verified spend: "
+            f"{summary['priced_invoice_count']} with recorded totals summing to "
+            f"{_currency(summary['total'])}."
+        )
+    else:
+        note = " Provisional invoices, excluded from verified spend, have no recorded totals."
+    if missing:
+        note += f" {missing} of {count} provisional invoice(s) have no recorded total."
+    return note
+
+
+def _tax_summary(
+    db_path: str | Path,
+    where: str,
+    timings: dict[str, float],
+) -> dict:
+    rows = _rows(
+        db_path,
+        f"""SELECT SUM(total_tax) AS total,
+                   COUNT(*) AS invoice_count,
+                   COUNT(total_tax) AS recorded_count,
+                   COUNT(*) - COUNT(total_tax) AS missing_count
+            FROM invoices WHERE {where}""",
+        timings=timings,
+    )
+    return rows[0]
+
+
+def _provisional_tax_note(summary: dict) -> str:
+    if not summary["invoice_count"]:
+        return ""
+    if summary["recorded_count"]:
+        note = (
+            f" Provisional invoices, excluded from verified tax, have recorded tax "
+            f"totalling {_currency(summary['total'])} across "
+            f"{summary['recorded_count']} invoice(s)."
+        )
+    else:
+        note = " Provisional invoices, excluded from verified tax, have no recorded tax totals."
+    if summary["missing_count"]:
+        note += f" Tax is not recorded on {summary['missing_count']} provisional invoice(s)."
+    return note
+
+
+def _gst_breakdown(db_path: str | Path, where: str, timings: dict[str, float]) -> dict:
+    rows = _rows(
+        db_path,
+        f"""SELECT SUM(cgst) AS cgst, COUNT(cgst) AS cgst_count,
+                   SUM(sgst) AS sgst, COUNT(sgst) AS sgst_count,
+                   SUM(igst) AS igst, COUNT(igst) AS igst_count,
+                   SUM(total_tax) AS total_tax, COUNT(total_tax) AS total_tax_count,
+                   COUNT(*) AS invoice_count
+            FROM invoices WHERE {where}""",
+        timings=timings,
+    )
+    return rows[0]
+
+
+def _gst_value(value, count: int) -> str:
+    return _currency(value) if count else "not recorded"
+
+
+def _gst_missing_note(summary: dict, status: str) -> str:
+    missing = [
+        component.upper()
+        for component in ("cgst", "sgst", "igst")
+        if summary[f"{component}_count"] < summary["invoice_count"]
+    ]
+    if not missing:
+        return ""
+    return (
+        f" GST components are not recorded for every {status} invoice "
+        f"({', '.join(missing)})."
+    )
+
+
 def _answer_intent(
     db_path: str | Path, intent: dict[str, Any], timings: dict[str, float]
 ) -> tuple[str, list[dict], dict, dict]:
@@ -347,107 +454,240 @@ def _answer_intent(
 
     if name in {"spend_total", "spend_yearly"}:
         period_filter, period_parameters = _date_filter(intent)
-        where = f"{verified} AND {period_filter}"
         rows = _rows(
             db_path,
-            f"SELECT COALESCE(SUM(grand_total),0) AS total, COUNT(*) AS count "
-            f"FROM invoices WHERE {where}",
+            f"""SELECT SUM(CASE WHEN validation_status = 'Verified' THEN grand_total END) AS total,
+                       COUNT(CASE WHEN validation_status = 'Verified' AND grand_total IS NOT NULL THEN 1 END) AS count,
+                       COUNT(CASE WHEN validation_status = 'Verified' AND grand_total IS NULL THEN 1 END) AS missing_verified_total_count
+                FROM invoices WHERE {period_filter}""",
             period_parameters,
             timings,
         )
-        support, support_count = _supporting_invoices(db_path, where, period_parameters, timings)
+        provisional_summary, provisional_support = _provisional_spend_summary(
+            db_path, period_filter, period_parameters, timings
+        )
+        verified_where = f"{verified} AND {period_filter}"
+        support, support_count = _supporting_invoices(
+            db_path, verified_where, period_parameters, timings
+        )
+        calculation = {
+            "total": rows[0]["total"],
+            "count": rows[0]["count"],
+            "supporting_invoice_count": support_count,
+            "provisional_summary": provisional_summary,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+            "missing_verified_total_count": rows[0]["missing_verified_total_count"],
+        }
         if not rows[0]["count"]:
             period_name = "the selected period" if period_filter != "1 = 1" else "any period"
-            return f"No verified invoices are recorded for {period_name}.", support, context, {"total": None}
+            answer = f"No verified invoice totals are recorded for {period_name}."
+            if rows[0]["missing_verified_total_count"]:
+                answer += (
+                    f" {rows[0]['missing_verified_total_count']} verified invoice(s) "
+                    "have no recorded total."
+                )
+            answer += _provisional_spend_note(provisional_summary)
+            return answer, support, context, calculation
         if intent.get("period") == "month":
             label = date(int(intent["year"]), int(intent["month"]), 1).strftime("%B %Y")
         elif intent.get("period") == "year":
             label = str(intent["year"])
         else:
             label = "all time"
-        return (
+        answer = (
             f"Verified expenditure for {label} is {_currency(rows[0]['total'])} "
-            f"across {rows[0]['count']} invoices.",
-            support,
-            context,
-            {"total": rows[0]["total"], "count": rows[0]["count"], "supporting_invoice_count": support_count},
+            f"across {rows[0]['count']} invoices."
         )
+        if rows[0]["missing_verified_total_count"]:
+            answer += (
+                f" {rows[0]['missing_verified_total_count']} verified invoice(s) "
+                "have no recorded total and are excluded from the sum."
+            )
+        answer += _provisional_spend_note(provisional_summary)
+        return answer, support, context, calculation
 
     if name == "spend_monthly":
         year = int(intent.get("year", date.today().year))
-        where = f"{verified} AND invoice_date >= ? AND invoice_date < ?"
         parameters = (f"{year:04d}-01-01", f"{year + 1:04d}-01-01")
         rows = _rows(
             db_path,
             "SELECT substr(invoice_date,1,7) AS month, SUM(grand_total) AS amount, "
-            "COUNT(*) AS invoice_count FROM invoices WHERE "
-            + where + " GROUP BY substr(invoice_date,1,7) ORDER BY month",
+            "COUNT(grand_total) AS invoice_count, "
+            "COUNT(*) - COUNT(grand_total) AS missing_total_count FROM invoices WHERE "
+            + verified + " AND invoice_date >= ? AND invoice_date < ? "
+            "GROUP BY substr(invoice_date,1,7) ORDER BY month",
             parameters,
             timings,
         )
+        provisional_summary, provisional_support = _provisional_spend_summary(
+            db_path, "invoice_date >= ? AND invoice_date < ?", parameters, timings
+        )
+        provisional_months = _rows(
+            db_path,
+            """SELECT substr(invoice_date,1,7) AS month,
+                      SUM(grand_total) AS amount,
+                      COUNT(*) AS invoice_count,
+                      COUNT(grand_total) AS priced_invoice_count
+               FROM invoices
+               WHERE (validation_status IS NULL OR validation_status != 'Verified')
+                 AND invoice_date >= ? AND invoice_date < ?
+               GROUP BY substr(invoice_date,1,7) ORDER BY month""",
+            parameters,
+            timings,
+        )
+        where = f"{verified} AND invoice_date >= ? AND invoice_date < ?"
         support, support_count = _supporting_invoices(db_path, where, parameters, timings)
+        calculation = {
+            "months": rows,
+            "supporting_invoice_count": support_count,
+            "provisional_summary": provisional_summary,
+            "provisional_months": provisional_months,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+        }
         if not rows:
-            return f"No dated verified invoices are recorded for {year}.", support, context, {}
+            answer = f"No dated verified invoices are recorded for {year}."
+            answer += _provisional_spend_note(provisional_summary)
+            return answer, support, context, calculation
         answer = f"Monthly verified expenditure for {year}: " + "; ".join(
-            f"{row['month']}: {_currency(row['amount'])} ({row['invoice_count']} invoices)"
+            f"{row['month']}: "
+            f"{_currency(row['amount']) if row['amount'] is not None else 'amount not recorded'} "
+            f"({row['invoice_count']} invoices with totals)"
             for row in rows
         )
-        return answer, support, context, {"months": rows, "supporting_invoice_count": support_count}
+        missing_verified_totals = sum(row["missing_total_count"] for row in rows)
+        if missing_verified_totals:
+            answer += (
+                f" {missing_verified_totals} verified invoice(s) have no recorded total "
+                "and are excluded from the monthly sums."
+            )
+        answer += _provisional_spend_note(provisional_summary)
+        return answer, support, context, calculation
 
     if name == "tax_total":
-        rows = _rows(
-            db_path,
-            f"SELECT COALESCE(SUM(total_tax),0) AS total, COUNT(*) AS count FROM invoices WHERE {verified}",
-            timings=timings,
-        )
+        result = _tax_summary(db_path, verified, timings)
+        provisional_where = "(validation_status IS NULL OR validation_status != 'Verified')"
+        provisional_summary = _tax_summary(db_path, provisional_where, timings)
         support, support_count = _supporting_invoices(db_path, verified, (), timings)
-        if not rows[0]["count"]:
-            return "No verified invoices with recorded tax are available.", support, context, {}
-        return (
-            f"Recorded GST/tax on verified invoices is {_currency(rows[0]['total'])}.",
-            support,
-            context,
-            {"tax_total": rows[0]["total"], "count": rows[0]["count"], "supporting_invoice_count": support_count},
+        provisional_support, _ = _supporting_invoices(
+            db_path, provisional_where, (), timings
         )
+        calculation = {
+            "tax_total": result["total"],
+            "count": result["recorded_count"],
+            "verified_invoice_count": result["invoice_count"],
+            "missing_tax_count": result["missing_count"],
+            "provisional_summary": provisional_summary,
+            "supporting_invoice_count": support_count,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+        }
+        if not result["recorded_count"]:
+            answer = "No verified invoices have recorded tax amounts."
+        else:
+            answer = (
+                f"Recorded GST/tax on verified invoices is {_currency(result['total'])}, "
+                f"from {result['recorded_count']} invoice(s)."
+            )
+        if result["missing_count"]:
+            answer += f" Tax is not recorded on {result['missing_count']} verified invoice(s)."
+        answer += _provisional_tax_note(provisional_summary)
+        return answer, support, context, calculation
 
     if name == "gst_breakdown":
-        rows = _rows(
-            db_path,
-            f"SELECT COALESCE(SUM(cgst),0) AS cgst, COALESCE(SUM(sgst),0) AS sgst, "
-            f"COALESCE(SUM(igst),0) AS igst, COALESCE(SUM(total_tax),0) AS total, "
-            f"COUNT(*) AS count FROM invoices WHERE {verified}",
-            timings=timings,
-        )
+        result = _gst_breakdown(db_path, verified, timings)
+        provisional_where = "(validation_status IS NULL OR validation_status != 'Verified')"
+        provisional_summary = _gst_breakdown(db_path, provisional_where, timings)
         support, support_count = _supporting_invoices(db_path, verified, (), timings)
-        if not rows[0]["count"]:
-            return "No verified invoices contain a recorded GST breakdown.", support, context, {}
-        result = rows[0]
-        answer = (
-            f"Recorded GST on verified invoices: CGST {_currency(result['cgst'])}, "
-            f"SGST {_currency(result['sgst'])}, IGST {_currency(result['igst'])}; "
-            f"recorded total tax {_currency(result['total'])}."
+        provisional_support, _ = _supporting_invoices(
+            db_path, provisional_where, (), timings
         )
-        return answer, support, context, {**result, "supporting_invoice_count": support_count}
+        has_verified_tax = any(result[f"{field}_count"] for field in ("cgst", "sgst", "igst", "total_tax"))
+        if not has_verified_tax:
+            answer = "No verified invoices contain a recorded GST breakdown."
+        else:
+            answer = (
+                f"Recorded GST on verified invoices: "
+                f"CGST {_gst_value(result['cgst'], result['cgst_count'])}, "
+                f"SGST {_gst_value(result['sgst'], result['sgst_count'])}, "
+                f"IGST {_gst_value(result['igst'], result['igst_count'])}; "
+                f"recorded total tax {_gst_value(result['total_tax'], result['total_tax_count'])}."
+            )
+        answer += _gst_missing_note(result, "verified")
+        if provisional_summary["invoice_count"]:
+            if any(
+                provisional_summary[f"{field}_count"]
+                for field in ("cgst", "sgst", "igst", "total_tax")
+            ):
+                answer += (
+                    " Provisional GST, excluded from verified totals: "
+                    f"CGST {_gst_value(provisional_summary['cgst'], provisional_summary['cgst_count'])}, "
+                    f"SGST {_gst_value(provisional_summary['sgst'], provisional_summary['sgst_count'])}, "
+                    f"IGST {_gst_value(provisional_summary['igst'], provisional_summary['igst_count'])}; "
+                    f"recorded total tax {_gst_value(provisional_summary['total_tax'], provisional_summary['total_tax_count'])}."
+                )
+            else:
+                answer += " Provisional invoices are excluded and have no recorded GST components."
+            answer += _gst_missing_note(provisional_summary, "provisional")
+        calculation = {
+            **result,
+            "provisional_summary": provisional_summary,
+            "supporting_invoice_count": support_count,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+        }
+        return answer, support, context, calculation
 
     if name == "average_total":
         rows = _rows(
             db_path,
-            f"SELECT AVG(grand_total) AS average, COUNT(*) AS count FROM invoices WHERE {verified}",
+            f"SELECT AVG(grand_total) AS average, COUNT(grand_total) AS count, "
+            f"COUNT(*) - COUNT(grand_total) AS missing_total_count FROM invoices WHERE {verified}",
+            timings=timings,
+        )
+        provisional_where = "(validation_status IS NULL OR validation_status != 'Verified')"
+        provisional_rows = _rows(
+            db_path,
+            f"""SELECT AVG(grand_total) AS average, COUNT(grand_total) AS count,
+                       COUNT(*) AS invoice_count,
+                       COUNT(*) - COUNT(grand_total) AS missing_total_count
+                FROM invoices WHERE {provisional_where}""",
             timings=timings,
         )
         support, support_count = _supporting_invoices(db_path, verified, (), timings)
-        if not rows[0]["count"]:
-            return "No verified invoices are available to calculate an average.", support, context, {}
-        return (
-            f"The average verified invoice value is {_currency(rows[0]['average'])} "
-            f"across {rows[0]['count']} invoices.",
-            support,
-            context,
-            {"average": rows[0]["average"], "count": rows[0]["count"], "supporting_invoice_count": support_count},
+        provisional_support, _ = _supporting_invoices(
+            db_path, provisional_where, (), timings
         )
+        provisional = provisional_rows[0]
+        calculation = {
+            "provisional_summary": provisional,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+            "supporting_invoice_count": support_count,
+        }
+        if not rows[0]["count"]:
+            answer = "No verified invoice totals are available to calculate an average."
+        else:
+            answer = (
+                f"The average verified invoice value is {_currency(rows[0]['average'])} "
+                f"across {rows[0]['count']} invoices."
+            )
+            calculation.update(rows[0])
+        if provisional["count"]:
+            answer += (
+                f" The provisional average is {_currency(provisional['average'])} "
+                f"across {provisional['count']} recorded totals, excluded from verified results."
+            )
+        elif provisional["invoice_count"]:
+            answer += " Provisional invoices have no recorded totals for an average."
+        return answer, support, context, calculation
 
     if name in {"vendor_top", "vendor_frequency"}:
-        aggregate = "COUNT(*) AS invoice_count" if name == "vendor_frequency" else "SUM(grand_total) AS amount, COUNT(*) AS invoice_count"
+        aggregate = (
+            "COUNT(*) AS invoice_count, COUNT(grand_total) AS priced_invoice_count, "
+            "SUM(grand_total) AS amount"
+        )
         order = "invoice_count DESC, vendor_name COLLATE NOCASE" if name == "vendor_frequency" else "amount DESC, vendor_name COLLATE NOCASE"
         rows = _rows(
             db_path,
@@ -455,24 +695,85 @@ def _answer_intent(
             f"AND vendor_name IS NOT NULL GROUP BY vendor_name ORDER BY {order} LIMIT 1",
             timings=timings,
         )
+        provisional_where = "(validation_status IS NULL OR validation_status != 'Verified')"
+        provisional_aggregate = (
+            "COUNT(*) AS invoice_count, COUNT(grand_total) AS priced_invoice_count, "
+            "SUM(grand_total) AS amount"
+        )
+        provisional_order = (
+            "invoice_count DESC, vendor_name COLLATE NOCASE"
+            if name == "vendor_frequency"
+            else "amount DESC, vendor_name COLLATE NOCASE"
+        )
+        provisional_rows = _rows(
+            db_path,
+            f"SELECT vendor_name AS vendor, {provisional_aggregate} FROM invoices "
+            f"WHERE {provisional_where} AND vendor_name IS NOT NULL "
+            f"GROUP BY vendor_name ORDER BY {provisional_order} LIMIT 1",
+            timings=timings,
+        )
+        provisional_vendor_support = []
+        if provisional_rows:
+            provisional_vendor_support, _ = _supporting_invoices(
+                db_path,
+                f"{provisional_where} AND vendor_name = ?",
+                (provisional_rows[0]["vendor"],),
+                timings,
+            )
+        calculation = {
+            "provisional_vendor": provisional_rows[0] if provisional_rows else None,
+            "provisional_supporting_invoice_count": len(provisional_vendor_support),
+            "provisional_supporting_invoices": provisional_vendor_support,
+        }
         if not rows:
-            return "There are no verified invoices with vendor names to compare.", support, context, {}
+            answer = "There are no verified invoices with vendor names to compare."
+            if provisional_rows:
+                provisional_vendor = provisional_rows[0]
+                answer += (
+                    f" Provisional records are led by {provisional_vendor['vendor']} "
+                    f"with {provisional_vendor['invoice_count']} invoice(s); this is not "
+                    "included in verified vendor results."
+                )
+            return answer, support, context, calculation
         vendor = rows[0]["vendor"]
         where = f"{verified} AND vendor_name = ?"
         support, support_count = _supporting_invoices(db_path, where, (vendor,), timings)
         context["vendor"] = vendor
         if name == "vendor_frequency":
             answer = f"{vendor} appears most often, with {rows[0]['invoice_count']} verified invoices."
+        elif rows[0]["amount"] is None:
+            answer = f"{vendor} has verified invoices, but no verified invoice totals are recorded."
         else:
             answer = f"{vendor} is the highest-spending vendor at {_currency(rows[0]['amount'])}."
-        return answer, support, context, {**rows[0], "supporting_invoice_count": support_count}
+        if provisional_rows:
+            provisional_vendor = provisional_rows[0]
+            if name == "vendor_frequency":
+                answer += (
+                    f" The most frequent provisional vendor is {provisional_vendor['vendor']} "
+                    f"with {provisional_vendor['invoice_count']} invoice(s), not verified."
+                )
+            elif provisional_vendor["amount"] is not None:
+                answer += (
+                    f" The largest known provisional vendor total is "
+                    f"{provisional_vendor['vendor']} at {_currency(provisional_vendor['amount'])}, "
+                    "excluded from verified spend."
+                )
+            else:
+                answer += (
+                    f" Provisional records for {provisional_vendor['vendor']} have no "
+                    "recorded totals and are excluded from verified spend."
+                )
+        calculation.update(rows[0])
+        calculation["supporting_invoice_count"] = support_count
+        return answer, support, context, calculation
 
     if name == "category_top":
         limit = min(10, max(1, int(intent.get("limit", 5))))
         rows = _rows(
             db_path,
             """SELECT COALESCE(ii.category,'Other') AS category,
-                      SUM(COALESCE(ii.taxable_value,ii.amount,0)) AS amount
+                      SUM(COALESCE(ii.taxable_value,ii.amount)) AS amount,
+                      COUNT(COALESCE(ii.taxable_value,ii.amount)) AS priced_item_count
                FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id
                WHERE i.validation_status='Verified'
                GROUP BY COALESCE(ii.category,'Other')
@@ -480,11 +781,52 @@ def _answer_intent(
             (limit,),
             timings,
         )
-        if not rows:
-            return "No verified invoice line items are available for category totals.", support, context, {}
-        answer = "Top verified expense categories: " + "; ".join(
-            f"{row['category']} ({_currency(row['amount'])})" for row in rows
+        provisional_rows = _rows(
+            db_path,
+            """SELECT COALESCE(ii.category,'Other') AS category,
+                      SUM(COALESCE(ii.taxable_value,ii.amount)) AS amount,
+                      COUNT(*) AS item_count,
+                      COUNT(COALESCE(ii.taxable_value,ii.amount)) AS priced_item_count
+               FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id
+               WHERE (i.validation_status IS NULL OR i.validation_status != 'Verified')
+               GROUP BY COALESCE(ii.category,'Other')
+               ORDER BY amount DESC LIMIT ?""",
+            (limit,),
+            timings,
         )
+        provisional_support = []
+        if provisional_rows:
+            categories = [row["category"] for row in provisional_rows]
+            placeholders = ",".join("?" for _ in categories)
+            provisional_where = (
+                "(validation_status IS NULL OR validation_status != 'Verified') AND id IN "
+                "(SELECT invoice_id FROM invoice_items "
+                f"WHERE COALESCE(category,'Other') IN ({placeholders}))"
+            )
+            provisional_support, _ = _supporting_invoices(
+                db_path, provisional_where, tuple(categories), timings
+            )
+        calculation = {
+            "provisional_categories": provisional_rows,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+        }
+        if not rows:
+            answer = "No verified invoice line items are available for category totals."
+            if provisional_rows:
+                answer += " Provisional category totals are available separately and are not verified."
+            return answer, support, context, calculation
+        answer = "Top verified expense categories: " + "; ".join(
+            f"{row['category']} "
+            f"({_currency(row['amount']) if row['priced_item_count'] else 'amount not recorded'})"
+            for row in rows
+        )
+        if provisional_rows:
+            answer += " Provisional categories (excluded from verified totals): " + "; ".join(
+                f"{row['category']} "
+                f"({_currency(row['amount']) if row['amount'] is not None else 'amount not recorded'})"
+                for row in provisional_rows
+            ) + "."
         categories = [row["category"] for row in rows]
         context["category"] = categories[0]
         placeholders = ",".join("?" for _ in categories)
@@ -494,61 +836,182 @@ def _answer_intent(
             f"WHERE COALESCE(category,'Other') IN ({placeholders}))"
         )
         support, support_count = _supporting_invoices(db_path, where, tuple(categories), timings)
-        return answer, support, context, {"categories": rows, "supporting_invoice_count": support_count}
+        calculation.update({
+            "categories": rows,
+            "supporting_invoice_count": support_count,
+        })
+        return answer, support, context, calculation
 
     if name == "category_spend":
         category = str(intent.get("category") or "").strip()
         if not category:
             return "Which expense category should I look up?", support, context, {}
+        match_filter = (
+            "(lower(COALESCE(ii.category,'')) LIKE ? OR "
+            "lower(COALESCE(ii.description,'')) LIKE ?)"
+        )
         where = (
-            "i.validation_status='Verified' AND "
-            "(lower(COALESCE(ii.category,'')) LIKE ? OR lower(COALESCE(ii.description,'')) LIKE ?)"
+            "i.validation_status='Verified' AND " + match_filter
         )
         params = (f"%{category.lower()}%", f"%{category.lower()}%")
         rows = _rows(
             db_path,
-            "SELECT COALESCE(SUM(COALESCE(ii.taxable_value,ii.amount,0)),0) AS total, "
-            "COUNT(DISTINCT i.id) AS invoice_count FROM invoice_items ii "
+            "SELECT SUM(COALESCE(ii.taxable_value,ii.amount)) AS total, "
+            "COUNT(DISTINCT i.id) AS invoice_count, "
+            "COUNT(COALESCE(ii.taxable_value,ii.amount)) AS priced_item_count, "
+            "COUNT(*) AS item_count FROM invoice_items ii "
             "JOIN invoices i ON i.id=ii.invoice_id WHERE " + where,
+            params,
+            timings,
+        )
+        provisional_where = (
+            "(i.validation_status IS NULL OR i.validation_status != 'Verified') AND "
+            + match_filter
+        )
+        provisional_rows = _rows(
+            db_path,
+            "SELECT SUM(COALESCE(ii.taxable_value,ii.amount)) AS total, "
+            "COUNT(DISTINCT i.id) AS invoice_count, "
+            "COUNT(COALESCE(ii.taxable_value,ii.amount)) AS priced_item_count, "
+            "COUNT(*) AS item_count FROM invoice_items ii "
+            "JOIN invoices i ON i.id=ii.invoice_id WHERE " + provisional_where,
             params,
             timings,
         )
         support_where = (
             "validation_status='Verified' AND id IN "
             "(SELECT i.id FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id "
-            "WHERE (lower(COALESCE(ii.category,'')) LIKE ? OR lower(COALESCE(ii.description,'')) LIKE ?))"
+            f"WHERE {match_filter})"
         )
         support, support_count = _supporting_invoices(db_path, support_where, params, timings)
-        context["category"] = category
-        if not rows[0]["invoice_count"]:
-            return f"No verified line items match {category}.", support, context, {}
-        return (
-            f"Verified spending matching {category} is {_currency(rows[0]['total'])} "
-            f"across {rows[0]['invoice_count']} invoices.",
-            support,
-            context,
-            {**rows[0], "supporting_invoice_count": support_count},
+        provisional_support_where = (
+            "(validation_status IS NULL OR validation_status != 'Verified') AND id IN "
+            "(SELECT i.id FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id "
+            f"WHERE {match_filter})"
         )
+        provisional_support, _ = _supporting_invoices(
+            db_path, provisional_support_where, params, timings
+        )
+        context["category"] = category
+        calculation = {
+            "provisional_summary": provisional_rows[0],
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+        }
+        if not rows[0]["invoice_count"]:
+            answer = f"No verified line items match {category}."
+        elif not rows[0]["priced_item_count"]:
+            answer = f"Verified line items matching {category} have no recorded amounts."
+        else:
+            answer = (
+                f"Verified spending matching {category} is {_currency(rows[0]['total'])} "
+                f"across {rows[0]['invoice_count']} invoices."
+            )
+            if rows[0]["item_count"] > rows[0]["priced_item_count"]:
+                answer += (
+                    f" {rows[0]['item_count'] - rows[0]['priced_item_count']} matching "
+                    "line item(s) have no recorded amount."
+                )
+        provisional = provisional_rows[0]
+        if provisional["invoice_count"]:
+            if provisional["priced_item_count"]:
+                answer += (
+                    f" Provisional items matching {category} total "
+                    f"{_currency(provisional['total'])} across "
+                    f"{provisional['invoice_count']} invoice(s), excluded from verified spend."
+                )
+                if provisional["item_count"] > provisional["priced_item_count"]:
+                    answer += (
+                        f" {provisional['item_count'] - provisional['priced_item_count']} "
+                        "provisional line item(s) have no recorded amount."
+                    )
+            else:
+                answer += (
+                    f" Provisional items matching {category} have no recorded amounts "
+                    "and are excluded from verified spend."
+                )
+        calculation.update(rows[0])
+        calculation["supporting_invoice_count"] = support_count
+        return answer, support, context, calculation
 
     if name == "monthly_top":
         rows = _rows(
             db_path,
-            f"SELECT substr(invoice_date,1,7) AS month, SUM(grand_total) AS amount "
+            f"SELECT substr(invoice_date,1,7) AS month, SUM(grand_total) AS amount, "
+            f"COUNT(grand_total) AS priced_invoice_count "
             f"FROM invoices WHERE {verified} AND invoice_date IS NOT NULL "
             "GROUP BY substr(invoice_date,1,7) ORDER BY amount DESC LIMIT 1",
             timings=timings,
         )
+        provisional_where = (
+            "(validation_status IS NULL OR validation_status != 'Verified') "
+            "AND invoice_date IS NOT NULL"
+        )
+        provisional_rows = _rows(
+            db_path,
+            f"""SELECT substr(invoice_date,1,7) AS month,
+                       SUM(grand_total) AS amount,
+                       COUNT(*) AS invoice_count,
+                       COUNT(grand_total) AS priced_invoice_count
+                FROM invoices WHERE {provisional_where}
+                GROUP BY substr(invoice_date,1,7)
+                ORDER BY amount DESC LIMIT 1""",
+            timings=timings,
+        )
+        provisional_support = []
+        if provisional_rows:
+            provisional_bounds = _month_bounds(
+                int(provisional_rows[0]["month"][:4]),
+                int(provisional_rows[0]["month"][5:7]),
+            )
+            provisional_support, _ = _supporting_invoices(
+                db_path,
+                "(validation_status IS NULL OR validation_status != 'Verified') "
+                "AND invoice_date >= ? AND invoice_date < ?",
+                provisional_bounds,
+                timings,
+            )
+        calculation = {
+            "provisional_month": provisional_rows[0] if provisional_rows else None,
+            "provisional_supporting_invoice_count": len(provisional_support),
+            "provisional_supporting_invoices": provisional_support,
+        }
         if not rows:
-            return "There are no dated verified invoices to compare.", support, context, {}
+            answer = "There are no dated verified invoices to compare."
+            if provisional_rows:
+                provisional_month = provisional_rows[0]
+                amount = (
+                    _currency(provisional_month["amount"])
+                    if provisional_month["amount"] is not None
+                    else "no totals recorded"
+                )
+                answer += (
+                    f" The largest provisional month is {provisional_month['month']} "
+                    f"with {amount}, excluded from verified comparisons."
+                )
+            return answer, support, context, calculation
         bounds = _month_bounds(int(rows[0]["month"][:4]), int(rows[0]["month"][5:7]))
         where = f"{verified} AND invoice_date >= ? AND invoice_date < ?"
         support, support_count = _supporting_invoices(db_path, where, bounds, timings)
-        return (
-            f"{rows[0]['month']} had the highest verified expenditure at {_currency(rows[0]['amount'])}.",
-            support,
-            context,
-            {**rows[0], "supporting_invoice_count": support_count},
+        answer = (
+            f"{rows[0]['month']} had the highest verified expenditure at "
+            f"{_currency(rows[0]['amount']) if rows[0]['amount'] is not None else 'no totals recorded'}."
         )
+        if provisional_rows:
+            provisional_month = provisional_rows[0]
+            if provisional_month["amount"] is None:
+                answer += (
+                    f" Provisional invoices in {provisional_month['month']} have no "
+                    "recorded totals and are excluded from verified comparisons."
+                )
+            else:
+                answer += (
+                    f" The largest known provisional month is {provisional_month['month']} "
+                    f"at {_currency(provisional_month['amount'])}, excluded from verified spend."
+                )
+        calculation.update(rows[0])
+        calculation["supporting_invoice_count"] = support_count
+        return answer, support, context, calculation
 
     if name == "month_comparison":
         months = intent.get("months") or []
@@ -572,30 +1035,78 @@ def _answer_intent(
             comparisons.append(date(int(year), int(month), 1).strftime("%B %Y"))
         rows = _rows(
             db_path,
-            f"SELECT substr(invoice_date,1,7) AS month, SUM(grand_total) AS amount, COUNT(*) AS count "
+            f"SELECT substr(invoice_date,1,7) AS month, SUM(grand_total) AS amount, "
+            "COUNT(*) AS count, COUNT(grand_total) AS priced_invoice_count "
             f"FROM invoices WHERE {verified} AND ({' OR '.join(filters)}) "
             "GROUP BY substr(invoice_date,1,7)",
             tuple(parameters),
             timings,
         )
+        provisional_where = (
+            "(validation_status IS NULL OR validation_status != 'Verified') "
+            f"AND ({' OR '.join(filters)})"
+        )
+        provisional_rows = _rows(
+            db_path,
+            f"""SELECT substr(invoice_date,1,7) AS month,
+                       SUM(grand_total) AS amount,
+                       COUNT(*) AS count,
+                       COUNT(grand_total) AS priced_invoice_count
+                FROM invoices WHERE {provisional_where}
+                GROUP BY substr(invoice_date,1,7)""",
+            tuple(parameters),
+            timings,
+        )
         amounts = {row["month"]: row for row in rows}
-        if not rows:
-            return "No dated verified invoices match those months.", support, context, {}
         support_where = f"{verified} AND ({' OR '.join(filters)})"
         support, support_count = _supporting_invoices(db_path, support_where, tuple(parameters), timings)
+        provisional_support, _ = _supporting_invoices(
+            db_path, provisional_where, tuple(parameters), timings
+        )
+        provisional_amounts = {row["month"]: row for row in provisional_rows}
         formatted = []
         for year, month in months[:2]:
             key = f"{int(year):04d}-{int(month):02d}"
             value = amounts.get(key)
             formatted.append(
                 f"{date(int(year), int(month), 1).strftime('%B %Y')}: "
-                + (_currency(value["amount"]) if value else "no recorded verified spend")
+                + (
+                    _currency(value["amount"])
+                    if value and value["amount"] is not None
+                    else "no recorded verified spend"
+                )
+            )
+        answer = (
+            "Verified monthly expenditure comparison: " + "; ".join(formatted) + "."
+            if rows
+            else "No dated verified invoices match those months."
+        )
+        if provisional_rows:
+            provisional_formatted = []
+            for year, month in months[:2]:
+                key = f"{int(year):04d}-{int(month):02d}"
+                value = provisional_amounts.get(key)
+                provisional_formatted.append(
+                    f"{date(int(year), int(month), 1).strftime('%B %Y')}: "
+                    + (_currency(value["amount"]) if value and value["amount"] is not None
+                       else "no recorded provisional spend")
+                )
+            answer += (
+                " Provisional monthly totals (not verified): "
+                + "; ".join(provisional_formatted)
+                + "."
             )
         return (
-            "Verified monthly expenditure comparison: " + "; ".join(formatted) + ".",
+            answer,
             support,
             context,
-            {"months": rows, "supporting_invoice_count": support_count},
+            {
+                "months": rows,
+                "provisional_months": provisional_rows,
+                "supporting_invoice_count": support_count,
+                "provisional_supporting_invoice_count": len(provisional_support),
+                "provisional_supporting_invoices": provisional_support,
+            },
         )
 
     if name == "vendor_comparison":
@@ -610,15 +1121,53 @@ def _answer_intent(
             tuple(vendors),
             timings,
         )
-        if not rows:
-            return "No verified invoices were found for those vendors.", support, context, {}
+        provisional_where = (
+            "(validation_status IS NULL OR validation_status != 'Verified') "
+            "AND vendor_name IN (?, ?)"
+        )
+        provisional_rows = _rows(
+            db_path,
+            f"""SELECT vendor_name AS vendor, SUM(grand_total) AS amount,
+                       COUNT(*) AS invoice_count,
+                       COUNT(grand_total) AS priced_invoice_count
+                FROM invoices WHERE {provisional_where}
+                GROUP BY vendor_name ORDER BY amount DESC""",
+            tuple(vendors),
+            timings,
+        )
         where = f"{verified} AND vendor_name IN (?, ?)"
         support, support_count = _supporting_invoices(db_path, where, tuple(vendors), timings)
-        answer = "Verified vendor comparison: " + "; ".join(
-            f"{row['vendor']} {_currency(row['amount'])} ({row['invoice_count']} invoices)"
-            for row in rows
-        ) + "."
-        return answer, support, context, {"vendors": rows, "supporting_invoice_count": support_count}
+        provisional_support, _ = _supporting_invoices(
+            db_path, provisional_where, tuple(vendors), timings
+        )
+        if rows:
+            answer = "Verified vendor comparison: " + "; ".join(
+                f"{row['vendor']} "
+                f"{_currency(row['amount']) if row['amount'] is not None else 'amount not recorded'} "
+                f"({row['invoice_count']} invoices)"
+                for row in rows
+            ) + "."
+        else:
+            answer = "No verified invoices were found for those vendors."
+        if provisional_rows:
+            answer += " Provisional vendor totals (not verified): " + "; ".join(
+                f"{row['vendor']} "
+                f"{_currency(row['amount']) if row['amount'] is not None else 'amount not recorded'} "
+                f"({row['invoice_count']} invoices)"
+                for row in provisional_rows
+            ) + "."
+        return (
+            answer,
+            support,
+            context,
+            {
+                "vendors": rows,
+                "provisional_vendors": provisional_rows,
+                "supporting_invoice_count": support_count,
+                "provisional_supporting_invoice_count": len(provisional_support),
+                "provisional_supporting_invoices": provisional_support,
+            },
+        )
 
     if name == "amount_threshold":
         amount = float(intent.get("amount", 0))
@@ -787,7 +1336,7 @@ def answer_question(
         ],
         request_id=request_id,
     )
-    return {
+    response = {
         "answer": answer,
         "rows": rows,
         "supporting_invoices": rows,
@@ -796,3 +1345,7 @@ def answer_question(
         "calculation": calculation,
         "performance": rounded_timings,
     }
+    provisional_support = calculation.pop("provisional_supporting_invoices", None)
+    if provisional_support is not None:
+        response["provisional_invoices"] = provisional_support
+    return response

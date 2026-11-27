@@ -330,9 +330,25 @@ def get_dashboard_data(db_path: str | Path) -> dict:
                    COALESCE(SUM(CASE WHEN validation_status = 'Verified' THEN 1 ELSE 0 END), 0) AS total_invoices,
                    COUNT(*) AS invoice_count,
                    COALESCE(SUM(CASE WHEN validation_status = 'Verified' THEN total_tax ELSE 0 END), 0) AS total_tax,
+                   COUNT(CASE WHEN validation_status = 'Verified' AND total_tax IS NOT NULL THEN 1 END) AS tax_record_count,
+                   COUNT(CASE WHEN validation_status = 'Verified' AND total_tax IS NULL THEN 1 END) AS tax_missing_count,
                    COALESCE(AVG(CASE WHEN validation_status = 'Verified' THEN grand_total END), 0) AS average_invoice,
                    COALESCE(SUM(CASE WHEN validation_status != 'Verified' OR validation_status IS NULL THEN 1 ELSE 0 END), 0) AS needs_attention
             FROM invoices
+            """
+        ).fetchone()
+        provisional_summary = connection.execute(
+            """
+            SELECT COUNT(*) AS invoice_count,
+                   COUNT(grand_total) AS priced_invoice_count,
+                   COUNT(*) - COUNT(grand_total) AS missing_total_count,
+                   SUM(grand_total) AS total_expenses,
+                   COUNT(total_tax) AS tax_record_count,
+                   COUNT(*) - COUNT(total_tax) AS tax_missing_count,
+                   SUM(total_tax) AS total_tax,
+                   AVG(grand_total) AS average_invoice
+            FROM invoices
+            WHERE validation_status != 'Verified' OR validation_status IS NULL
             """
         ).fetchone()
         categories = connection.execute(
@@ -345,6 +361,19 @@ def get_dashboard_data(db_path: str | Path) -> dict:
             GROUP BY COALESCE(category, 'Other') ORDER BY amount DESC
             """
         ).fetchall()
+        provisional_categories = connection.execute(
+            """
+            SELECT COALESCE(category, 'Other') AS category,
+                   SUM(COALESCE(taxable_value, amount)) AS amount,
+                   COUNT(*) AS item_count,
+                   COUNT(COALESCE(taxable_value, amount)) AS priced_item_count
+            FROM invoice_items i
+            JOIN invoices n ON n.id = i.invoice_id
+            WHERE n.validation_status != 'Verified' OR n.validation_status IS NULL
+            GROUP BY COALESCE(category, 'Other')
+            ORDER BY amount DESC
+            """
+        ).fetchall()
         vendors = connection.execute(
             """
             SELECT COALESCE(vendor_name, 'Unknown') AS vendor,
@@ -354,12 +383,37 @@ def get_dashboard_data(db_path: str | Path) -> dict:
             GROUP BY COALESCE(vendor_name, 'Unknown') ORDER BY amount DESC LIMIT 10
             """
         ).fetchall()
+        provisional_vendors = connection.execute(
+            """
+            SELECT COALESCE(vendor_name, 'Unknown') AS vendor,
+                   SUM(grand_total) AS amount,
+                   COUNT(*) AS invoice_count,
+                   COUNT(grand_total) AS priced_invoice_count
+            FROM invoices
+            WHERE validation_status != 'Verified' OR validation_status IS NULL
+            GROUP BY COALESCE(vendor_name, 'Unknown')
+            ORDER BY amount DESC LIMIT 10
+            """
+        ).fetchall()
         monthly = connection.execute(
             """
             SELECT substr(invoice_date, 1, 7) AS month, COALESCE(SUM(grand_total), 0) AS amount
             FROM invoices
             WHERE invoice_date IS NOT NULL AND validation_status = 'Verified'
             GROUP BY substr(invoice_date, 1, 7) ORDER BY month
+            """
+        ).fetchall()
+        provisional_monthly = connection.execute(
+            """
+            SELECT substr(invoice_date, 1, 7) AS month,
+                   SUM(grand_total) AS amount,
+                   COUNT(*) AS invoice_count,
+                   COUNT(grand_total) AS priced_invoice_count
+            FROM invoices
+            WHERE invoice_date IS NOT NULL
+              AND (validation_status != 'Verified' OR validation_status IS NULL)
+            GROUP BY substr(invoice_date, 1, 7)
+            ORDER BY month
             """
         ).fetchall()
         recent = connection.execute(
@@ -371,9 +425,13 @@ def get_dashboard_data(db_path: str | Path) -> dict:
         ).fetchall()
         return {
             "summary": dict(summary),
+            "provisional_summary": dict(provisional_summary),
             "categories": [dict(row) for row in categories],
+            "provisional_categories": [dict(row) for row in provisional_categories],
             "vendors": [dict(row) for row in vendors],
+            "provisional_vendors": [dict(row) for row in provisional_vendors],
             "monthly": [dict(row) for row in monthly],
+            "provisional_monthly": [dict(row) for row in provisional_monthly],
             "recent": [dict(row) for row in recent],
         }
 

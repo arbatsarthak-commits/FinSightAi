@@ -58,7 +58,35 @@ def test_chat_financial_totals_use_verified_rows_and_show_support(tmp_path):
     assert answer["intent"] == "spend_total"
     assert answer["calculation"]["total"] == 354
     assert {row["id"] for row in answer["supporting_invoices"]} == {first, second}
+    assert answer["calculation"]["provisional_summary"]["total"] == 500
+    assert answer["provisional_invoices"][0]["validation_status"] == "Needs Attention"
     assert "₹354.00" in answer["answer"]
+    assert "excluded from verified spend" in answer["answer"]
+
+
+def test_chat_total_explains_unpriced_provisional_invoices(tmp_path):
+    db_path = tmp_path / "chat-unpriced-provisional.db"
+    initialize_database(db_path)
+    save_extracted_invoice(
+        db_path,
+        {
+            "invoice_number": "INV-UNPRICED",
+            "invoice_date": "2026-11-05",
+            "vendor_name": "Example Vendor",
+            "grand_total": None,
+        },
+        "unpriced.png",
+        {"status": "Needs Attention"},
+        "{}",
+    )
+
+    answer = answer_question(db_path, "What is my total expenditure?")
+
+    assert answer["calculation"]["total"] is None
+    assert answer["calculation"]["provisional_summary"]["missing_total_count"] == 1
+    assert answer["provisional_invoices"][0]["grand_total"] is None
+    assert "no verified invoice totals" in answer["answer"].lower()
+    assert "no recorded totals" in answer["answer"]
 
 
 def test_chat_followup_uses_previous_vendor_context(tmp_path):
@@ -121,9 +149,13 @@ def test_monthly_yearly_and_month_comparison_queries_use_database_dates(tmp_path
 
     assert monthly["intent"] == "spend_monthly"
     assert len(monthly["calculation"]["months"]) == 2
+    assert monthly["calculation"]["provisional_summary"]["total"] == 500
+    assert monthly["provisional_invoices"][0]["validation_status"] == "Needs Attention"
     assert yearly["calculation"]["total"] == 354
     assert comparison["intent"] == "month_comparison"
     assert len(comparison["supporting_invoices"]) == 2
+    assert comparison["calculation"]["provisional_months"][0]["amount"] == 500
+    assert comparison["provisional_invoices"][0]["validation_status"] == "Needs Attention"
 
 
 def test_gst_breakdown_and_category_queries_are_supported(tmp_path):
@@ -137,9 +169,47 @@ def test_gst_breakdown_and_category_queries_are_supported(tmp_path):
     assert taxes["intent"] == "gst_breakdown"
     assert taxes["calculation"]["cgst"] > 0
     assert len(taxes["supporting_invoices"]) == 2
+    assert taxes["calculation"]["provisional_summary"]["cgst"] > 0
+    assert taxes["provisional_invoices"][0]["validation_status"] == "Needs Attention"
     assert categories["intent"] == "category_top"
     assert categories["calculation"]["categories"][0]["category"] == "electronics"
+    assert categories["calculation"]["provisional_categories"][0]["category"] == "electronics"
     assert category_spend["calculation"]["invoice_count"] == 2
+    assert category_spend["calculation"]["provisional_summary"]["invoice_count"] == 1
+    assert category_spend["provisional_invoices"][0]["validation_status"] == "Needs Attention"
+
+
+def test_chat_does_not_report_missing_tax_as_zero(tmp_path):
+    db_path = tmp_path / "chat-missing-tax.db"
+    initialize_database(db_path)
+    save_extracted_invoice(
+        db_path,
+        {
+            "invoice_number": "INV-NO-TAX",
+            "invoice_date": "2026-11-05",
+            "vendor_name": "Example Vendor",
+            "grand_total": 100,
+            "items": [{
+                "description": "Unpriced electronics item",
+                "category": "electronics",
+            }],
+        },
+        "no-tax.png",
+        {"status": "Verified"},
+        "{}",
+    )
+
+    total = answer_question(db_path, "How much tax did I pay?")
+    breakdown = answer_question(db_path, "Show my GST breakdown")
+    category = answer_question(db_path, "How much did I spend on electronics?")
+
+    assert total["calculation"]["tax_total"] is None
+    assert total["calculation"]["missing_tax_count"] == 1
+    assert "no verified invoices have recorded tax amounts" in total["answer"].lower()
+    assert breakdown["calculation"]["cgst"] is None
+    assert "not recorded" in breakdown["answer"]
+    assert category["calculation"]["total"] is None
+    assert "no recorded amounts" in category["answer"]
 
 
 def test_vendor_frequency_invoice_lookup_and_product_search(tmp_path):
@@ -152,6 +222,7 @@ def test_vendor_frequency_invoice_lookup_and_product_search(tmp_path):
 
     assert frequent["intent"] == "vendor_frequency"
     assert frequent["context"]["vendor"] == "ABC Traders"
+    assert frequent["calculation"]["provisional_vendor"]["vendor"] == "Other Store"
     assert invoice["intent"] == "invoice_detail"
     assert invoice["context"]["invoice_number"] == "INV-1"
     assert invoice["calculation"]["line_items"][0]["description"] == "Electronics supply"

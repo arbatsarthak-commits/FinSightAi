@@ -140,3 +140,27 @@ def test_extracts_receipt_bill_number_total_and_wrapped_items_across_pages():
     ]
     assert [item["amount"] for item in invoice["items"]] == [399, 150]
     assert result["evidence"]["items"][1]["fields"]["description"]["page"] == 2
+
+
+def test_specific_total_label_and_order_identifiers_take_precedence():
+    lines = [
+        _line("Example Vendor", 20, 1),
+        _line("Invoice No: INV-25", 50, 2),
+        _line("Date: 12/04/2025", 80, 3),
+        _line("Order No: ORD-42 Pack No: PACK-8", 110, 4),
+        _line("Total: 100.00", 140, 5),
+        _line("Subtotal: 100.00", 170, 6),
+        _line("Total Amount: 118.00", 200, 7),
+    ]
+    result = extract_invoice_from_ocr({
+        "text": "\n".join(
+            " ".join(word["text"] for word in line) for line in lines
+        ),
+        "words": [word for line in lines for word in line],
+    })
+
+    assert result["invoice"]["grand_total"] == 118
+    assert result["evidence"]["grand_total"]["line"] == "Total Amount: 118.00"
+    assert result["invoice"]["order_number"] == "ORD-42"
+    assert result["invoice"]["pack_number"] == "PACK-8"
+    assert result["confidence"]["grand_total"] > 0.9

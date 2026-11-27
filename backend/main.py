@@ -106,6 +106,16 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def prevent_api_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 def require_pairing(x_pairing_token: Optional[str] = Header(default=None)):
     if not PAIRING_TOKEN or not x_pairing_token or not secrets.compare_digest(
         x_pairing_token, PAIRING_TOKEN

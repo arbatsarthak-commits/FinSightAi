@@ -16,12 +16,25 @@ _GSTIN_PATTERN = re.compile(
 )
 _NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\(?-?\d[\d,]*(?:\.\d{1,2})?\)?")
 _LABELS = {
-    "invoice_number": ("invoice number", "invoice no", "bill number", "bill no", "bill"),
+    "invoice_number": (
+        "invoice number", "invoice no", "invoice #", "bill number", "bill no",
+        "bill #", "receipt number", "receipt no", "receipt #", "bill",
+    ),
+    "order_number": ("order number", "order no", "order #"),
+    "pack_number": ("pack number", "pack no", "pack #"),
     "invoice_date": ("invoice date", "bill date", "date of invoice", "date"),
     "due_date": ("due date", "payment due", "due on"),
-    "vendor_name": ("vendor", "supplier", "seller", "billed by", "from"),
-    "customer_name": ("billed to", "bill to", "buyer", "customer", "ship to"),
-    "subtotal": ("taxable value", "taxable amount", "subtotal", "sub total"),
+    "vendor_name": (
+        "vendor name", "supplier name", "seller name", "merchant name",
+        "name of supplier", "billed by", "sold by", "supplier", "seller", "vendor",
+    ),
+    "customer_name": (
+        "customer name", "buyer name", "billed to", "bill to", "buyer", "customer", "ship to",
+    ),
+    "subtotal": (
+        "taxable value", "taxable amount", "item subtotal", "sub total",
+        "subtotal", "sum amount", "sum",
+    ),
     "cgst": ("cgst", "central tax"),
     "sgst": ("sgst", "state tax"),
     "igst": ("igst", "integrated tax"),
@@ -32,14 +45,19 @@ _LABELS = {
         "amount payable",
         "total payable",
         "net payable",
+        "final payable",
+        "final amount",
         "total amount",
         "total",
     ),
+    "round_off": ("round off", "round-off", "rounding"),
 }
 _TABLE_HEADERS = {
     "description": ("description", "particulars", "product", "item", "service"),
     "quantity": ("quantity", "qty", "units"),
     "unit_price": ("unit price", "rate", "price"),
+    "discount_percent": ("discount %", "disc %", "discount percent"),
+    "discount": ("discount", "disc"),
     "taxable_value": ("taxable value", "taxable amount", "assessable value"),
     "cgst": ("cgst",),
     "sgst": ("sgst",),
@@ -49,9 +67,32 @@ _TABLE_HEADERS = {
 _OCR_HEADER_CORRECTIONS = {"tten": "item", "oty": "qty", "ant": "amt"}
 _TABLE_END = re.compile(
     r"\b(?:sub\s*total|grand\s*total|total\s*payable|amount\s*payable|"
+    r"total\s+amount|tax\s+details|sum\s+amount|"
     r"cgst|sgst|igst|terms\s+and\s+conditions)\b",
     re.IGNORECASE,
 )
+_AMOUNT_LABEL_PRIORITY = {
+    "subtotal": {
+        "taxable value": 100,
+        "taxable amount": 100,
+        "item subtotal": 90,
+        "subtotal": 90,
+        "sub total": 90,
+        "sum amount": 85,
+        "sum": 70,
+    },
+    "grand_total": {
+        "grand total": 110,
+        "amount payable": 105,
+        "total payable": 105,
+        "net payable": 105,
+        "final payable": 105,
+        "final amount": 100,
+        "invoice total": 100,
+        "total amount": 100,
+        "total": 50,
+    },
+}
 
 
 def _line_groups(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -148,6 +189,17 @@ def _evidence(line: dict[str, Any] | None, source: str = "tesseract") -> dict[st
     }
 
 
+def _confidence_for(
+    evidence: dict[str, Any], reliability: float, method: str
+) -> float:
+    ocr_confidence = float(evidence.get("confidence", 0.0))
+    reliability = min(1.0, max(0.0, reliability))
+    evidence["ocr_confidence"] = ocr_confidence
+    evidence["pattern_reliability"] = reliability
+    evidence["extraction_method"] = method
+    return round(ocr_confidence * reliability, 3)
+
+
 def _find_label(text: str, aliases: tuple[str, ...]) -> tuple[int, str] | None:
     lowered = text.lower()
     for alias in sorted(aliases, key=len, reverse=True):
@@ -166,6 +218,10 @@ def _label_value(
             continue
         if aliases == _LABELS["invoice_number"] and re.search(
             r"\bbill\s*to\b", line["text"], re.IGNORECASE
+        ):
+            continue
+        if aliases == _LABELS["invoice_number"] and found[1] == "bill" and re.match(
+            r"\s*date\b", line["text"][found[0]:], re.IGNORECASE
         ):
             continue
         if (
@@ -225,11 +281,63 @@ def _parse_amount(value: str | None) -> float | None:
     return float(amount) if amount.is_finite() else None
 
 
+def _amount_after_label(line: dict[str, Any], alias: str) -> float | None:
+    found = _find_label(line["text"], (alias,))
+    if not found:
+        return None
+    remainder = line["text"][found[0]:]
+    remainder = re.sub(r"\b\d+(?:[.,]\d+)?\s*%", " ", remainder)
+    matches = _NUMBER_PATTERN.findall(remainder.replace("−", "-"))
+    if matches:
+        token = matches[0].strip("()").replace(",", "")
+        try:
+            parsed = Decimal(token)
+        except InvalidOperation:
+            return None
+        return float(parsed) if parsed.is_finite() else None
+    prefix = line["text"][:found[0] - len(alias)]
+    return _parse_amount(prefix)
+
+
 def _labelled_amount(lines: list[dict[str, Any]], field: str) -> tuple[float | None, dict[str, Any] | None]:
-    value, line = _label_value(lines, _LABELS[field])
-    if value:
-        value = re.sub(r"\b\d+(?:[.,]\d+)?\s*%", " ", value)
-    return _parse_amount(value), line
+    candidates = []
+    aliases = _LABELS[field]
+    for index, line in enumerate(lines):
+        found = _find_label(line["text"], aliases)
+        if not found:
+            continue
+        end, alias = found
+        remainder = line["text"][end:].strip(" \t:：-#")
+        if field in {"grand_total", "subtotal"} and alias in {
+            "total", "sum",
+        } and re.match(
+            r"\s*(?:tax|gst|items?|quantity|savings|saved)\b",
+            remainder,
+            re.IGNORECASE,
+        ):
+            continue
+        value = _amount_after_label(line, alias)
+        evidence_line = line
+        if value is None and not remainder and index + 1 < len(lines):
+            next_line = lines[index + 1]
+            all_labels = tuple(
+                alias for values in _LABELS.values() for alias in values
+            )
+            if next_line["page"] == line["page"] and not _find_label(
+                next_line["text"], all_labels
+            ):
+                value = _parse_amount(next_line["text"])
+                evidence_line = next_line
+        if value is None:
+            continue
+        priority = _AMOUNT_LABEL_PRIORITY.get(field, {}).get(alias, 80)
+        candidates.append((priority, line["page"], line["top"], value, evidence_line, alias))
+    if not candidates:
+        return None, None
+    _, _, _, value, line, alias = max(candidates, key=lambda item: item[:3])
+    line = dict(line)
+    line["matched_alias"] = alias
+    return value, line
 
 
 def _header_positions(line: dict[str, Any]) -> dict[str, float]:
@@ -322,16 +430,22 @@ def _table_items(
             }
             numeric_value_found = False
             for field in (
-                "quantity", "unit_price", "taxable_value", "cgst", "sgst", "igst", "amount"
+                "quantity", "unit_price", "discount_percent", "discount",
+                "taxable_value", "cgst", "sgst", "igst", "amount",
             ):
                 field_words = cells.get(field, [])
-                value = _parse_amount(_cell_value(field_words))
+                cell_text = _cell_value(field_words)
+                value = _parse_amount(cell_text)
+                if field == "discount" and value is not None and "%" in cell_text:
+                    item["discount_percent"] = value
+                    value = None
                 if value is not None:
                     item[field] = value
                     numeric_value_found = True
                     cell_line = {**line, "words": field_words}
                     cell_line.update(_line_geometry(field_words))
                     item_fields[field] = _evidence(cell_line)
+                    item_fields[field]["extraction_method"] = "ocr_coordinate_column"
                 else:
                     item_fields[field] = _evidence(None)
             if (
@@ -354,6 +468,11 @@ def _table_items(
             if "amount" not in item and "taxable_value" in item:
                 item["amount"] = item["taxable_value"]
                 item_fields["amount"] = item_fields["taxable_value"]
+                item["amount_basis"] = "taxable"
+            elif "taxable_value" in item:
+                item["amount_basis"] = "taxable"
+            elif "amount" in item:
+                item["amount_basis"] = "unknown"
             items.append(item)
             item_evidence.append({
                 "item": len(items),
@@ -377,7 +496,9 @@ def _party_gstin(lines: list[dict[str, Any]]) -> tuple[str | None, str | None, d
     return vendor_value, customer_value, vendor_line, customer_line
 
 
-def _vendor_fallback(lines: list[dict[str, Any]], gstin_line: dict[str, Any] | None) -> tuple[str | None, dict[str, Any] | None]:
+def _vendor_fallback(
+    lines: list[dict[str, Any]], gstin_line: dict[str, Any] | None
+) -> tuple[str | None, dict[str, Any] | None, str, float]:
     candidates = [
         line for line in lines
         if re.search(r"[A-Za-z]{3}", line["text"])
@@ -395,8 +516,20 @@ def _vendor_fallback(lines: list[dict[str, Any]], gstin_line: dict[str, Any] | N
             if line["page"] == gstin_line["page"] and line["top"] < gstin_line["top"]
         ]
         if above:
-            return above[0]["text"][:120], above[0]
-    return (candidates[0]["text"][:120], candidates[0]) if candidates else (None, None)
+            nearest = min(above, key=lambda line: gstin_line["top"] - line["top"])
+            line_height = max(1, nearest["height"], gstin_line["height"])
+            gap = max(0, gstin_line["top"] - (nearest["top"] + nearest["height"]))
+            if gap <= line_height * 2:
+                reliability = max(0.5, 1.0 - gap / (line_height * 4))
+                return (
+                    nearest["text"][:120],
+                    nearest,
+                    "gstin_adjacent_layout_fallback",
+                    reliability,
+                )
+    if candidates:
+        return candidates[0]["text"][:120], candidates[0], "topmost_text_layout_fallback", 0.55
+    return None, None, "not_found", 0.0
 
 
 def extract_invoice_from_ocr(ocr: dict[str, Any]) -> dict[str, Any]:
@@ -414,15 +547,37 @@ def extract_invoice_from_ocr(ocr: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "items": [],
         "currency": "INR" if re.search(r"(?:₹|\bINR\b|\bRs\.?)", raw_text, re.IGNORECASE) else None,
+        "tax_inclusive": (
+            True
+            if re.search(
+                r"\b(?:tax(?:es)?|gst|vat)\s+(?:is\s+)?inclusive\b|"
+                r"\binclusive\s+of\s+(?:all\s+)?(?:tax(?:es)?|gst|vat)\b",
+                raw_text,
+                re.IGNORECASE,
+            )
+            else None
+        ),
     }
     evidence: dict[str, Any] = {}
     confidence: dict[str, float] = {}
 
-    for field in ("invoice_number", "invoice_date", "due_date", "vendor_name", "customer_name"):
+    direct_reliability = {
+        "invoice_number": 0.96,
+        "order_number": 0.94,
+        "pack_number": 0.92,
+        "invoice_date": 0.96,
+        "due_date": 0.94,
+        "vendor_name": 0.96,
+        "customer_name": 0.96,
+    }
+    for field in (
+        "invoice_number", "order_number", "pack_number", "invoice_date",
+        "due_date", "vendor_name", "customer_name",
+    ):
         value, line = _label_value(lines, _LABELS[field])
         if field in {"invoice_date", "due_date"}:
             value = _parse_date(value)
-        elif field == "invoice_number" and value:
+        elif field in {"invoice_number", "order_number", "pack_number"} and value:
             match = re.search(r"[A-Za-z0-9][A-Za-z0-9/_-]{1,40}", value)
             value = match.group(0) if match else None
         elif field in {"vendor_name", "customer_name"} and value:
@@ -430,7 +585,11 @@ def extract_invoice_from_ocr(ocr: dict[str, Any]) -> dict[str, Any]:
             value = value[:120] or None
         payload[field] = value
         evidence[field] = _evidence(line)
-        confidence[field] = evidence[field]["confidence"] if value else 0.0
+        confidence[field] = _confidence_for(
+            evidence[field],
+            direct_reliability[field] if value else 0.0,
+            "explicit_label" if value else "not_found",
+        )
 
     vendor_gstin, customer_gstin, vendor_gstin_line, customer_gstin_line = _party_gstin(lines)
     payload["vendor_gstin"] = vendor_gstin
@@ -440,19 +599,41 @@ def extract_invoice_from_ocr(ocr: dict[str, Any]) -> dict[str, Any]:
         ("customer_gstin", customer_gstin, customer_gstin_line),
     ):
         evidence[field] = _evidence(line)
-        confidence[field] = evidence[field]["confidence"] if value else 0.0
+        confidence[field] = _confidence_for(
+            evidence[field], 0.99 if value else 0.0,
+            "gstin_format_match" if value else "not_found",
+        )
 
     if not payload.get("vendor_name"):
-        vendor_name, vendor_line = _vendor_fallback(lines, vendor_gstin_line)
+        vendor_name, vendor_line, method, reliability = _vendor_fallback(
+            lines, vendor_gstin_line
+        )
         payload["vendor_name"] = vendor_name
-        evidence["vendor_name"] = _evidence(vendor_line, "layout heuristic" if vendor_line else "missing")
-        confidence["vendor_name"] = min(0.65, evidence["vendor_name"]["confidence"]) if vendor_name else 0.0
+        evidence["vendor_name"] = _evidence(
+            vendor_line, "layout heuristic" if vendor_line else "missing"
+        )
+        confidence["vendor_name"] = _confidence_for(
+            evidence["vendor_name"], reliability, method
+        )
 
-    for field in ("subtotal", "cgst", "sgst", "igst", "total_tax", "grand_total"):
+    amount_fields = (
+        "subtotal", "cgst", "sgst", "igst", "total_tax", "round_off", "grand_total"
+    )
+    for field in amount_fields:
         value, line = _labelled_amount(lines, field)
         payload[field] = value
         evidence[field] = _evidence(line)
-        confidence[field] = evidence[field]["confidence"] if value is not None else 0.0
+        alias = line.get("matched_alias") if line else None
+        reliability = 0.98 if value is not None else 0.0
+        if field == "grand_total" and alias == "total":
+            reliability = 0.65
+        elif field == "subtotal" and alias == "sum":
+            reliability = 0.78
+        confidence[field] = _confidence_for(
+            evidence[field],
+            reliability,
+            f"amount_label:{alias}" if value is not None else "not_found",
+        )
 
     items, item_evidence = _table_items(lines)
     payload["items"] = items

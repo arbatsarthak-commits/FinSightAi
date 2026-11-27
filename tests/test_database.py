@@ -1,6 +1,7 @@
 import sqlite3
 
 from backend.database.database import (
+    get_dashboard_data,
     get_invoice_details,
     initialize_database,
     record_performance_metrics,
@@ -155,3 +156,44 @@ def test_evidence_and_metrics_are_persisted_with_query_indexes(tmp_path):
     assert "idx_invoice_items_category_normalized" in item_indexes
     assert "idx_invoice_items_description" in item_indexes
     assert metric == ("ocr", 0.25)
+
+
+def test_dashboard_separates_verified_and_provisional_aggregates(tmp_path):
+    db_path = tmp_path / "dashboard.db"
+    initialize_database(db_path)
+    for number, status, amount in (
+        ("INV-VERIFIED", "Verified", 118),
+        ("INV-PROVISIONAL", "Needs Attention", 236),
+    ):
+        save_extracted_invoice(
+            db_path,
+            {
+                "invoice_number": number,
+                "invoice_date": "2026-11-22",
+                "vendor_name": "Example",
+                "subtotal": amount - 18,
+                "total_tax": 18,
+                "grand_total": amount,
+                "items": [{
+                    "description": "Service",
+                    "amount": amount - 18,
+                    "taxable_value": amount - 18,
+                    "category": "services",
+                }],
+            },
+            f"{number}.png",
+            {"status": status},
+            "{}",
+        )
+
+    dashboard = get_dashboard_data(db_path)
+
+    assert dashboard["summary"]["total_expenses"] == 118
+    assert dashboard["summary"]["total_invoices"] == 1
+    assert dashboard["summary"]["invoice_count"] == 2
+    assert dashboard["provisional_summary"]["total_expenses"] == 236
+    assert dashboard["provisional_summary"]["invoice_count"] == 1
+    assert dashboard["provisional_summary"]["tax_record_count"] == 1
+    assert dashboard["provisional_vendors"][0]["amount"] == 236
+    assert dashboard["provisional_monthly"][0]["amount"] == 236
+    assert dashboard["provisional_categories"][0]["amount"] == 218

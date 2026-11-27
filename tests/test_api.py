@@ -66,6 +66,19 @@ def test_overview_endpoint():
     assert "summary" in response.json()
 
 
+def test_api_responses_are_not_cached(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "uncached.db")
+    initialize_database(main.DB_PATH)
+
+    response = client.get("/api/analytics/overview", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == (
+        "no-store, no-cache, must-revalidate, max-age=0"
+    )
+    assert response.headers["pragma"] == "no-cache"
+
+
 def test_private_endpoints_require_pairing():
     for path in (
         "/api/system/status",
