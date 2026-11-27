@@ -3,7 +3,7 @@
 ## Deployment model
 
 GitHub Pages serves the React/Vite frontend at
-<https://arbatsarthak-commits.github.io/FinSightAi/>. FastAPI, Ollama/Mistral,
+<https://arbatsarthak-commits.github.io/FinSightAi/>. FastAPI, Ollama/Qwen,
 Tesseract/OpenCV, invoice uploads, and SQLite remain on the user's Windows
 computer. The static website is not a backend host and does not receive local
 database files or invoice documents as part of deployment.
@@ -34,14 +34,14 @@ to `127.0.0.1`; do not bind it publicly or configure a router port-forward.
 ## Run and connect the local backend
 
 Install the prerequisites and Python dependencies as described in
-[README.md](README.md). Start Ollama and ensure `mistral` is available. In a
+[README.md](README.md). Start Ollama and ensure `qwen2.5:1.5b` is available. In a
 PowerShell terminal at the repository root, set any local overrides and start
 FastAPI:
 
 ```powershell
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
 $env:OLLAMA_HOST = 'http://localhost:11434'
-$env:OLLAMA_MODEL = 'mistral'
+$env:OLLAMA_MODEL = 'qwen2.5:1.5b'
 $env:FRONTEND_ORIGINS = 'http://127.0.0.1:5173,http://localhost:5173,https://arbatsarthak-commits.github.io'
 .\start_backend.ps1
 ```
@@ -104,9 +104,8 @@ is also under the repository prefix. GitHub Actions performs the same build.
 - 401 response: use the token printed by that running backend; never move it
   into a frontend config or GitHub Actions variable.
 - OCR/model unavailable: verify `TESSERACT_CMD`, that Ollama is running, and
-  that `ollama pull mistral` has completed.
+  that `ollama pull qwen2.5:1.5b` has completed.
 
-The root `.env.example` is a reference file; the PowerShell startup script
-does not automatically load `.env`. Set overrides in the backend terminal
-before starting it. `.gitignore` excludes environment files, the token file,
+The backend reads `.env` from the repository root; process environment values
+take precedence. `.gitignore` excludes environment files, the token file,
 SQLite databases, uploads, logs, and generated OCR output.

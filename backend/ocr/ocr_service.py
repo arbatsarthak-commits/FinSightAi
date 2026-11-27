@@ -6,12 +6,12 @@ import tempfile
 import time
 from functools import lru_cache
 from typing import Callable
+from PIL import Image, UnidentifiedImageError
 
-from config import TESSERACT_CMD
+from config import MAX_IMAGE_PIXELS, MAX_PDF_PAGES, OCR_TIMEOUT_SECONDS, TESSERACT_CMD
 from backend.preprocessing.image_processor import preprocess_image, SUPPORTED_IMAGE_EXTENSIONS
 
 _OCR_CACHE: dict[tuple[str, str, int], dict] = {}
-MAX_PDF_PAGES = 30
 MAX_PDF_PAGE_PIXELS = 12_000_000
 MAX_PDF_TOTAL_PIXELS = 60_000_000
 
@@ -28,6 +28,31 @@ class RenderedPagePaths(list[Path]):
         self.limit_reason = limit_reason
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+
+def validate_document_file(source: str | Path) -> None:
+    source = Path(source)
+    suffix = source.suffix.lower()
+    if suffix == ".pdf":
+        with source.open("rb") as handle:
+            if not handle.read(1024).lstrip().startswith(b"%PDF-"):
+                raise ValueError("The uploaded file is not a valid PDF.")
+        return
+    expected_formats = {".jpg": {"JPEG"}, ".jpeg": {"JPEG"}, ".png": {"PNG"}}
+    if suffix not in expected_formats:
+        raise ValueError("Unsupported file type. Use JPG, JPEG, PNG or PDF.")
+    try:
+        with Image.open(source) as image:
+            width, height = image.size
+            if width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS:
+                raise ValueError(
+                    f"Image dimensions exceed the {MAX_IMAGE_PIXELS:,}-pixel safety limit."
+                )
+            if image.format not in expected_formats[suffix]:
+                raise ValueError("The image content does not match its file extension.")
+            image.verify()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("The image is corrupted or cannot be decoded.") from exc
 
 
 @lru_cache(maxsize=1)
@@ -69,24 +94,27 @@ def pdf_to_images(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         for page_number in range(min(total_pages, max_pages)):
-            page = document.load_page(page_number)
-            page_area = max(1.0, page.rect.width * page.rect.height)
-            remaining_pixels = MAX_PDF_TOTAL_PIXELS - rendered_pixels
-            if remaining_pixels <= 0 and images:
-                limit_reason = (
-                    f"the {MAX_PDF_TOTAL_PIXELS:,}-pixel total rendering limit"
+            try:
+                page = document.load_page(page_number)
+                page_area = max(1.0, page.rect.width * page.rect.height)
+                remaining_pixels = MAX_PDF_TOTAL_PIXELS - rendered_pixels
+                if remaining_pixels <= 0 and images:
+                    limit_reason = (
+                        f"the {MAX_PDF_TOTAL_PIXELS:,}-pixel total rendering limit"
+                    )
+                    break
+                scale = min(
+                    2.0,
+                    (min(MAX_PDF_PAGE_PIXELS, remaining_pixels) / page_area) ** 0.5,
                 )
-                break
-            scale = min(
-                2.0,
-                (min(MAX_PDF_PAGE_PIXELS, remaining_pixels) / page_area) ** 0.5,
-            )
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-            image_path = output_dir / f"page_{page_number + 1}.png"
-            pixmap.save(str(image_path))
-            images.append(image_path)
-            rendered_pixels += pixmap.width * pixmap.height
-            del pixmap
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                image_path = output_dir / f"page_{page_number + 1}.png"
+                pixmap.save(str(image_path))
+                images.append(image_path)
+                rendered_pixels += pixmap.width * pixmap.height
+                del pixmap
+            except Exception as exc:
+                raise ValueError(f"PDF page {page_number + 1} could not be rendered: {exc}") from exc
         if total_pages > len(images) and limit_reason is None:
             if len(images) >= max_pages:
                 limit_reason = f"the {max_pages}-page processing limit"
@@ -105,6 +133,7 @@ def extract_document(
     if not source.exists():
         raise FileNotFoundError(f"Invoice file not found: {source}")
     suffix = source.suffix.lower()
+    validate_document_file(source)
     pdf_conversion_seconds = 0.0
     temporary_directory = None
     total_pages = 1
@@ -169,10 +198,15 @@ def extract_document(
                 started = time.perf_counter()
                 try:
                     data = pytesseract.image_to_data(
-                        processed, config="--psm 6", output_type=pytesseract.Output.DICT
+                        processed, config="--psm 6", output_type=pytesseract.Output.DICT,
+                        timeout=OCR_TIMEOUT_SECONDS,
                     )
                 except pytesseract.TesseractError as exc:
                     raise RuntimeError(f"OCR failed on page {page_number}: {exc}") from exc
+                except RuntimeError as exc:
+                    raise TimeoutError(
+                        f"OCR timed out on page {page_number} after {OCR_TIMEOUT_SECONDS} seconds."
+                    ) from exc
                 preliminary_confidences = [
                     float(conf)
                     for conf in data["conf"]
@@ -189,9 +223,15 @@ def extract_document(
                             processed,
                             config="--psm 11",
                             output_type=pytesseract.Output.DICT,
+                            timeout=OCR_TIMEOUT_SECONDS,
                         )
                     except pytesseract.TesseractError as exc:
                         raise RuntimeError(f"OCR fallback failed on page {page_number}: {exc}") from exc
+                    except RuntimeError as exc:
+                        raise TimeoutError(
+                            f"OCR fallback timed out on page {page_number} after "
+                            f"{OCR_TIMEOUT_SECONDS} seconds."
+                        ) from exc
                 ocr_seconds += time.perf_counter() - started
                 if on_stage:
                     on_stage("Tesseract OCR", "Complete", f"Page {page_number}")

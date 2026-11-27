@@ -1,6 +1,9 @@
 import os
 import threading
 import time
+from io import BytesIO
+
+from PIL import Image
 
 os.environ["LOCAL_API_TOKEN"] = "test-pairing-token-that-is-at-least-32-chars"
 
@@ -8,11 +11,21 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import main
-from backend.database.database import initialize_database, save_extracted_invoice
+from backend.database.database import (
+    initialize_database,
+    load_processing_jobs,
+    save_extracted_invoice,
+)
 
 
 client = TestClient(main.app)
 HEADERS = {"X-Pairing-Token": os.environ["LOCAL_API_TOKEN"]}
+
+
+def _png_bytes():
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def test_health_endpoint():
@@ -36,6 +49,15 @@ def test_rejects_unsupported_upload():
     assert response.status_code == 415
 
 
+def test_rejects_corrupted_image_upload():
+    response = client.post(
+        "/api/invoices/upload",
+        files={"file": ("invoice.png", b"not an image", "image/png")},
+        headers=HEADERS,
+    )
+    assert response.status_code == 400
+
+
 def test_overview_endpoint():
     response = client.get("/api/analytics/overview", headers=HEADERS)
     assert response.status_code == 200
@@ -55,6 +77,9 @@ def test_private_endpoints_require_pairing():
         "/api/reports/export",
     ):
         assert client.get(path).status_code == 401
+    assert client.post("/api/assistant/query", json={"question": "test"}).status_code == 401
+    assert client.put("/api/invoices/1", json={"vendor_name": "Test"}).status_code == 401
+    assert client.delete("/api/invoices/1").status_code == 401
 
 
 def test_github_pages_origin_is_allowed_for_local_backend():
@@ -76,9 +101,23 @@ def test_github_pages_origin_is_allowed_for_local_backend():
     assert "post" in response.headers["access-control-allow-methods"].lower()
 
 
-def test_manual_approval_and_edit_routes_are_removed():
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+def test_invoice_management_methods_pass_cors_preflight(method):
+    response = client.options(
+        "/api/invoices/1",
+        headers={
+            "Origin": "https://arbatsarthak-commits.github.io",
+            "Access-Control-Request-Method": method,
+            "Access-Control-Request-Headers": "content-type,x-pairing-token",
+        },
+    )
+    assert response.status_code == 200
+    assert method.lower() in response.headers["access-control-allow-methods"].lower()
+
+
+def test_manual_approval_route_is_removed_and_correction_route_is_available():
     assert client.post("/api/invoices/1/approve", headers=HEADERS).status_code == 404
-    assert client.put("/api/invoices/1", headers=HEADERS, json={}).status_code == 405
+    assert client.put("/api/invoices/1", headers=HEADERS, json={}).status_code == 400
 
 
 def test_analyze_returns_real_job_progress_and_auto_saved_result(tmp_path, monkeypatch):
@@ -110,7 +149,7 @@ def test_analyze_returns_real_job_progress_and_auto_saved_result(tmp_path, monke
     monkeypatch.setattr(main, "process_invoice", fake_process)
     uploaded = client.post(
         "/api/invoices/upload",
-        files={"file": ("invoice.png", b"invoice bytes", "image/png")},
+        files={"file": ("invoice.png", _png_bytes(), "image/png")},
         headers=HEADERS,
     )
     assert uploaded.status_code == 200
@@ -131,6 +170,8 @@ def test_analyze_returns_real_job_progress_and_auto_saved_result(tmp_path, monke
     assert status["stages"]["File validation"]["status"] == "Complete"
     assert status["result"]["auto_saved"] is True
     assert status["result"]["performance"]["upload_seconds"] >= 0
+    persisted = load_processing_jobs(main.DB_PATH, time.time() - 60)
+    assert any(job["job_id"] == queued.json()["job_id"] and job["status"] == "complete" for job in persisted)
 
 
 def test_identical_uploads_share_one_active_processing_job(tmp_path, monkeypatch):
@@ -152,7 +193,7 @@ def test_identical_uploads_share_one_active_processing_job(tmp_path, monkeypatch
     try:
         first_upload = client.post(
             "/api/invoices/upload",
-            files={"file": ("invoice.png", b"same invoice content", "image/png")},
+            files={"file": ("invoice.png", _png_bytes(), "image/png")},
             headers=HEADERS,
         )
         first_job = client.post(
@@ -163,7 +204,7 @@ def test_identical_uploads_share_one_active_processing_job(tmp_path, monkeypatch
 
         second_upload = client.post(
             "/api/invoices/upload",
-            files={"file": ("invoice-copy.png", b"same invoice content", "image/png")},
+            files={"file": ("invoice-copy.png", _png_bytes(), "image/png")},
             headers=HEADERS,
         )
         second_job = client.post(
@@ -222,7 +263,7 @@ def test_missing_pairing_configuration_fails_startup(monkeypatch):
             pass
 
 
-def test_delete_route_is_removed_and_record_is_preserved(tmp_path, monkeypatch):
+def test_delete_route_removes_invoice_and_only_its_stored_file(tmp_path, monkeypatch):
     data_dir = tmp_path / "uploads"
     data_dir.mkdir()
     monkeypatch.setattr(main, "DATA_DIR", data_dir)
@@ -244,6 +285,72 @@ def test_delete_route_is_removed_and_record_is_preserved(tmp_path, monkeypatch):
 
     response = client.delete(f"/api/invoices/{invoice_id}", headers=HEADERS)
 
-    assert response.status_code == 405
-    assert uploaded_file.exists()
-    assert main.get_invoice_details(main.DB_PATH, invoice_id)
+    assert response.status_code == 200
+    assert not uploaded_file.exists()
+    assert not main.get_invoice_details(main.DB_PATH, invoice_id)
+
+
+def test_invoice_correction_revalidates_financial_totals(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "correction.db")
+    initialize_database(main.DB_PATH)
+    invoice = {
+        "invoice_number": "INV-CORRECTION",
+        "invoice_date": "2026-11-23",
+        "vendor_name": "Example vendor",
+        "subtotal": 100,
+        "cgst": 9,
+        "sgst": 9,
+        "igst": 0,
+        "total_tax": 18,
+        "grand_total": 118,
+        "items": [{
+            "description": "Service",
+            "quantity": 1,
+            "unit_price": 100,
+            "taxable_value": 100,
+            "amount": 100,
+        }],
+    }
+    invoice_id = save_extracted_invoice(
+        main.DB_PATH, invoice, "correction.png", {"status": "Verified"}, "{}"
+    )
+
+    invalid = client.put(
+        f"/api/invoices/{invoice_id}", headers=HEADERS, json={"grand_total": 100}
+    )
+    valid = client.put(
+        f"/api/invoices/{invoice_id}", headers=HEADERS, json={"grand_total": 118}
+    )
+
+    assert invalid.status_code == valid.status_code == 200
+    assert invalid.json()["validation"]["status"] == "Validation Failed"
+    assert valid.json()["validation"]["status"] == "Verified"
+
+
+def test_assistant_endpoint_returns_database_answer_not_sql(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "assistant.db")
+    initialize_database(main.DB_PATH)
+    save_extracted_invoice(
+        main.DB_PATH,
+        {
+            "invoice_number": "INV-CHAT",
+            "invoice_date": "2026-11-23",
+            "vendor_name": "Example vendor",
+            "grand_total": 236,
+            "total_tax": 36,
+            "items": [],
+        },
+        "chat.png",
+        {"status": "Verified"},
+        "{}",
+    )
+
+    response = client.post(
+        "/api/assistant/query",
+        headers=HEADERS,
+        json={"question": "How much GST have I paid?"},
+    )
+
+    assert response.status_code == 200
+    assert "₹36.00" in response.json()["answer"]
+    assert "query" not in response.json()

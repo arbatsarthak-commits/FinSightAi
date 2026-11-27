@@ -10,7 +10,7 @@ from typing import Callable
 
 from config import DB_PATH
 from backend.database.database import initialize_database, save_extracted_invoice
-from backend.llm.mistral_service import extract_invoice_with_metrics
+from backend.llm.mistral_service import extract_invoice_with_metrics, extract_rule_fields
 from backend.ocr.ocr_service import extract_document
 from backend.validation.validation_engine import validate_invoice
 
@@ -33,14 +33,23 @@ def file_sha256(path: str | Path) -> str:
 def field_evidence(raw_text: str, invoice: dict) -> dict:
     evidence = {}
     text_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    rules = extract_rule_fields(raw_text)
     field_aliases = {
         "invoice_number": ("invoice number", "invoice no", "invoice #", "bill number"),
-        "invoice_date": ("invoice date", "date"),
+        "invoice_date": ("invoice date", "bill date"),
+        "due_date": ("due date", "payment due"),
         "vendor_name": ("vendor", "from", "billed by"),
         "vendor_gstin": ("gstin", "gst in", "gst no"),
+        "customer_name": ("bill to", "customer"),
+        "customer_gstin": ("customer gstin", "buyer gstin"),
         "subtotal": ("subtotal", "taxable amount", "taxable subtotal"),
+        "cgst": ("cgst", "central tax"),
+        "sgst": ("sgst", "state tax"),
+        "igst": ("igst", "integrated tax"),
         "total_tax": ("total tax", "gst total", "tax amount"),
         "grand_total": ("grand total", "invoice total", "amount payable", "total payable"),
+        "currency": ("currency",),
+        "payment_status": ("payment status", "status"),
     }
     for field, aliases in field_aliases.items():
         value = invoice.get(field)
@@ -50,11 +59,30 @@ def field_evidence(raw_text: str, invoice: dict) -> dict:
         matches = [
             line for line in text_lines
             if any(alias in line.lower() for alias in aliases)
+            or str(value).lower() in line.lower()
         ]
+        rule_value = rules.get(field)
         evidence[field] = {
-            "source": "ocr",
+            "source": "python rule" if rule_value == value else "OCR evidence" if matches else "AI extraction",
             "line": matches[0][:240] if matches else None,
         }
+    item_evidence = []
+    for index, item in enumerate(invoice.get("items") or [], start=1):
+        fields = {}
+        for field, value in item.items():
+            if value in (None, ""):
+                fields[field] = {"source": "missing", "line": None}
+                continue
+            matches = [
+                line for line in text_lines
+                if str(value).lower() in line.lower()
+            ]
+            fields[field] = {
+                "source": "OCR evidence" if matches else "AI extraction",
+                "line": matches[0][:240] if matches else None,
+            }
+        item_evidence.append({"item": index, "fields": fields})
+    evidence["items"] = item_evidence
     return evidence
 
 
@@ -155,14 +183,31 @@ def process_invoice(
         with closing(sqlite3.connect(DB_PATH)) as connection:
             duplicate = None
             if invoice_number:
-                duplicate = connection.execute(
-                    """SELECT id, validation_status, processing_status
-                       FROM invoices
-                       WHERE invoice_number IS NOT NULL
-                         AND lower(trim(invoice_number)) = lower(trim(?))
-                       LIMIT 1""",
-                    (invoice_number,),
-                ).fetchone()
+                vendor_gstin = invoice.get("vendor_gstin")
+                vendor_name = invoice.get("vendor_name")
+                invoice_date = invoice.get("invoice_date")
+                if vendor_gstin:
+                    duplicate = connection.execute(
+                        """SELECT id, validation_status, processing_status
+                           FROM invoices WHERE lower(trim(invoice_number)) = lower(trim(?))
+                             AND lower(trim(vendor_gstin)) = lower(trim(?)) LIMIT 1""",
+                        (invoice_number, vendor_gstin),
+                    ).fetchone()
+                elif vendor_name:
+                    duplicate = connection.execute(
+                        """SELECT id, validation_status, processing_status
+                           FROM invoices WHERE lower(trim(invoice_number)) = lower(trim(?))
+                             AND lower(trim(vendor_name)) = lower(trim(?))
+                             AND COALESCE(invoice_date, '') = COALESCE(?, '') LIMIT 1""",
+                        (invoice_number, vendor_name, invoice_date),
+                    ).fetchone()
+                else:
+                    duplicate = connection.execute(
+                        """SELECT id, validation_status, processing_status
+                           FROM invoices WHERE lower(trim(invoice_number)) = lower(trim(?))
+                           LIMIT 1""",
+                        (invoice_number,),
+                    ).fetchone()
         performance["invoice_number_duplicate_check_seconds"] = round(
             time.perf_counter() - duplicate_started, 4
         )

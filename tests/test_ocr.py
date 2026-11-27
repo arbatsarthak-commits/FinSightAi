@@ -24,6 +24,31 @@ def test_blank_image_is_rejected(tmp_path):
         extract_document(image_path)
 
 
+def test_image_pixel_limit_is_checked_before_decode(tmp_path, monkeypatch):
+    image_path = tmp_path / "large.png"
+    cv2.imwrite(str(image_path), np.full((20, 20, 3), 255, dtype=np.uint8))
+    monkeypatch.setattr(ocr_service, "MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(ValueError, match="pixel safety limit"):
+        ocr_service.validate_document_file(image_path)
+
+
+def test_ocr_timeout_is_reported_by_page(tmp_path, monkeypatch):
+    image_path = tmp_path / "invoice.png"
+    image = np.full((200, 300, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (20, 20), (200, 80), (0, 0, 0), -1)
+    cv2.imwrite(str(image_path), image)
+    monkeypatch.setattr(ocr_service, "check_tesseract", lambda: "5.5")
+    monkeypatch.setattr(
+        ocr_service.pytesseract,
+        "image_to_data",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("timeout")),
+    )
+
+    with pytest.raises(TimeoutError, match="page 1"):
+        extract_document(image_path)
+
+
 def test_pdf_conversion_does_not_stop_at_ten_pages(tmp_path):
     fitz = pytest.importorskip("fitz")
     pdf_path = tmp_path / "multipage.pdf"
@@ -79,7 +104,7 @@ def test_ocr_uses_one_tesseract_pass_and_reconstructs_lines(tmp_path, monkeypatc
 
 def test_pdf_page_images_are_cleaned_after_extraction(tmp_path, monkeypatch):
     pdf_path = tmp_path / "invoice.pdf"
-    pdf_path.write_bytes(b"test pdf")
+    pdf_path.write_bytes(b"%PDF-1.4\n%test")
 
     def fake_pdf_to_images(source, output_dir, max_pages):
         image_path = Path(output_dir) / "page_1.png"
@@ -117,7 +142,7 @@ def test_pdf_page_images_are_cleaned_after_extraction(tmp_path, monkeypatch):
 
 def test_pdf_page_limit_is_reported_as_partial(tmp_path, monkeypatch):
     pdf_path = tmp_path / "long-invoice.pdf"
-    pdf_path.write_bytes(b"test pdf")
+    pdf_path.write_bytes(b"%PDF-1.4\n%test")
     conversions = []
 
     def fake_pdf_to_images(source, output_dir, max_pages):

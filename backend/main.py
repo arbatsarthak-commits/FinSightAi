@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import io
+import json
 import logging
 import os
 import secrets
@@ -16,17 +17,22 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
-from config import DB_PATH, OLLAMA_HOST, OLLAMA_MODEL, LAYOUTLM_MODEL
+from config import DB_PATH, LAYOUTLM_MODEL
 from backend.database.database import (
     initialize_database,
     get_dashboard_data,
     get_invoice_details,
+    load_processing_jobs,
+    save_processing_job,
 )
 from backend.services.invoice_pipeline import process_invoice, InvoiceProcessingError
 from backend.llm.mistral_service import ollama_status
-from backend.ocr.ocr_service import check_tesseract
-from backend.services.sql_assistant import execute_read_only
+from backend.ocr.ocr_service import check_tesseract, validate_document_file
+from backend.services.chat_assistant import answer_question
+from backend.models.invoice import InvoiceData
+from backend.validation.validation_engine import validate_invoice
 
 
 PAIRING_TOKEN = os.getenv("LOCAL_API_TOKEN", "")
@@ -40,6 +46,19 @@ _active_upload_jobs: dict[str, str] = {}
 _active_upload_hashes: dict[str, str] = {}
 _upload_timings: dict[str, float] = {}
 _processing_jobs_lock = threading.RLock()
+
+
+for _job in load_processing_jobs(DB_PATH, time.time() - 3600):
+    if _job["status"] in {"queued", "processing"}:
+        _job.update(
+            status="failed",
+            current_stage="Interrupted",
+            error="Backend restarted during processing. Submit the upload again to retry.",
+            updated_at=time.time(),
+        )
+        save_processing_job(DB_PATH, _job)
+    _processing_jobs[_job["job_id"]] = _job
+
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -68,7 +87,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(frontend_origins),
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Pairing-Token"],
 )
 
@@ -112,7 +131,6 @@ def health():
 def system_status(x_pairing_token: Optional[str] = Header(default=None)):
     require_pairing(x_pairing_token)
     ollama = ollama_status()
-    ollama.pop("error", None)
     try:
         tesseract_version = check_tesseract()
         ocr_status = "available"
@@ -162,6 +180,11 @@ async def upload_invoice(request: Request, file: UploadFile = File(...),
     if size == 0:
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    try:
+        validate_document_file(destination)
+    except ValueError as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     upload_seconds = round(time.perf_counter() - started, 4)
     with _processing_jobs_lock:
         _upload_timings[safe_name] = upload_seconds
@@ -233,16 +256,34 @@ def analyze_invoice(upload_id: str, request: Request,
         job_id = str(uuid.uuid4())
         _processing_jobs[job_id] = {
             "job_id": job_id,
+            "upload_id": upload_id,
             "status": "queued",
             "current_stage": "Queued",
             "stages": {},
             "created_at": time.time(),
+            "updated_at": time.time(),
         }
         _active_upload_jobs[upload_id] = job_id
         _active_upload_hashes[source_hash] = job_id
         upload_seconds = _upload_timings.pop(upload_id, 0.0)
+        queued_jobs = sorted(
+            (
+                item for item in _processing_jobs.values()
+                if item["status"] == "queued"
+            ),
+            key=lambda item: item["created_at"],
+        )
+        queue_position = next(
+            (index for index, item in enumerate(queued_jobs, start=1) if item["job_id"] == job_id),
+            1,
+        )
+        queued_record = copy.deepcopy(_processing_jobs[job_id])
+    save_processing_job(DB_PATH, queued_record)
     _processing_executor.submit(_run_processing_job, job_id, upload_id, path, upload_seconds)
-    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued"})
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "queued", "queue_position": queue_position},
+    )
 
 
 def _run_processing_job(job_id: str, upload_id: str, path: Path, upload_seconds: float) -> None:
@@ -252,6 +293,9 @@ def _run_processing_job(job_id: str, upload_id: str, path: Path, upload_seconds:
             job["status"] = "processing"
             job["current_stage"] = stage
             job["stages"][stage] = {"status": status, "detail": detail}
+            job["updated_at"] = time.time()
+            snapshot = copy.deepcopy(job)
+        save_processing_job(DB_PATH, snapshot)
 
     try:
         result = process_invoice(
@@ -259,13 +303,28 @@ def _run_processing_job(job_id: str, upload_id: str, path: Path, upload_seconds:
         )
         with _processing_jobs_lock:
             _processing_jobs[job_id].update(
-                status="complete", current_stage="Complete", result=result
+                status="complete", current_stage="Complete", result=result,
+                updated_at=time.time(),
             )
+            snapshot = copy.deepcopy(_processing_jobs[job_id])
+        save_processing_job(DB_PATH, snapshot)
     except InvoiceProcessingError as exc:
         with _processing_jobs_lock:
             _processing_jobs[job_id].update(
-                status="failed", current_stage="Failed", error=str(exc)
+                status="failed", current_stage="Failed", error=str(exc),
+                updated_at=time.time(),
             )
+            snapshot = copy.deepcopy(_processing_jobs[job_id])
+        save_processing_job(DB_PATH, snapshot)
+    except (RuntimeError, ValueError, TimeoutError, FileNotFoundError) as exc:
+        logger.warning("Invoice processing stopped for upload %s: %s", upload_id, exc)
+        with _processing_jobs_lock:
+            _processing_jobs[job_id].update(
+                status="failed", current_stage="Failed", error=str(exc),
+                updated_at=time.time(),
+            )
+            snapshot = copy.deepcopy(_processing_jobs[job_id])
+        save_processing_job(DB_PATH, snapshot)
     except Exception:
         logger.exception("Invoice processing failed for upload %s", upload_id)
         with _processing_jobs_lock:
@@ -273,7 +332,10 @@ def _run_processing_job(job_id: str, upload_id: str, path: Path, upload_seconds:
                 status="failed",
                 current_stage="Failed",
                 error="Invoice processing failed. Check local service status and retry.",
+                updated_at=time.time(),
             )
+            snapshot = copy.deepcopy(_processing_jobs[job_id])
+        save_processing_job(DB_PATH, snapshot)
     finally:
         with _processing_jobs_lock:
             _active_upload_jobs.pop(upload_id, None)
@@ -290,7 +352,19 @@ def processing_status(job_id: str,
         job = _processing_jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Processing job not found.")
-        return copy.deepcopy(job)
+        result = copy.deepcopy(job)
+        queued = sorted(
+            (
+                item for item in _processing_jobs.values()
+                if item["status"] == "queued"
+            ),
+            key=lambda item: item["created_at"],
+        )
+        result["queue_position"] = next(
+            (index for index, item in enumerate(queued, start=1) if item["job_id"] == job_id),
+            None,
+        )
+        return result
 
 
 @app.get("/api/invoices")
@@ -302,7 +376,7 @@ def list_invoices(search: Optional[str] = None,
         connection.row_factory = sqlite3.Row
         query = """SELECT id, invoice_number, invoice_date, due_date, vendor_name,
                           vendor_gstin, customer_name, customer_gstin, grand_total,
-                          total_tax, currency, payment_status, source_file,
+                          subtotal, total_tax, currency, payment_status, source_file,
                           validation_status, processing_status, created_at
                    FROM invoices"""
         parameters = []
@@ -331,6 +405,91 @@ def invoice_details(invoice_id: int,
     details["invoice"].pop("approval_status", None)
     details["invoice"].pop("corrected_data", None)
     return details
+
+
+@app.put("/api/invoices/{invoice_id}")
+def correct_invoice(invoice_id: int, payload: dict,
+                    x_pairing_token: Optional[str] = Header(default=None)):
+    require_pairing(x_pairing_token)
+    if not isinstance(payload, dict) or not payload:
+        raise HTTPException(status_code=400, detail="Provide at least one invoice field to correct.")
+    allowed_fields = {
+        "invoice_number", "invoice_date", "due_date", "vendor_name", "vendor_gstin",
+        "customer_name", "customer_gstin", "subtotal", "cgst", "sgst", "igst",
+        "total_tax", "grand_total", "currency", "payment_status",
+    }
+    if set(payload) - allowed_fields:
+        raise HTTPException(status_code=422, detail="One or more invoice fields cannot be edited.")
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT extracted_data, corrected_data FROM invoices WHERE id = ?",
+            (invoice_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+    try:
+        existing_data = json.loads(row["corrected_data"] or row["extracted_data"] or "{}")
+        if not isinstance(existing_data, dict):
+            raise ValueError("Stored invoice data is invalid.")
+        invoice = InvoiceData.model_validate({**existing_data, **payload})
+    except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invoice correction is invalid: {exc}") from exc
+    corrected = invoice.model_dump()
+    validation = validate_invoice(corrected)
+    processing_status = "Processed" if validation["status"] == "Verified" else "Needs Attention"
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """UPDATE invoices SET invoice_number=?, invoice_date=?, due_date=?,
+               vendor_name=?, vendor_gstin=?, customer_name=?, customer_gstin=?,
+               subtotal=?, cgst=?, sgst=?, igst=?, total_tax=?, grand_total=?,
+               currency=?, payment_status=?, corrected_data=?, validation_status=?,
+               processing_status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (
+                corrected["invoice_number"], corrected["invoice_date"], corrected["due_date"],
+                corrected["vendor_name"], corrected["vendor_gstin"], corrected["customer_name"],
+                corrected["customer_gstin"], corrected["subtotal"], corrected["cgst"],
+                corrected["sgst"], corrected["igst"], corrected["total_tax"],
+                corrected["grand_total"], corrected["currency"], corrected["payment_status"],
+                json.dumps(corrected, ensure_ascii=False), validation["status"],
+                processing_status, invoice_id,
+            ),
+        )
+        connection.commit()
+    return {
+        "invoice_id": invoice_id,
+        "invoice": corrected,
+        "validation": validation,
+        "processing_status": processing_status,
+    }
+
+
+@app.delete("/api/invoices/{invoice_id}")
+def delete_invoice(invoice_id: int,
+                   x_pairing_token: Optional[str] = Header(default=None)):
+    require_pairing(x_pairing_token)
+    source_file = None
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        row = connection.execute(
+            "SELECT source_file FROM invoices WHERE id = ?", (invoice_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        source_file = row[0]
+        connection.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+        remaining = (
+            connection.execute(
+                "SELECT COUNT(*) FROM invoices WHERE source_file = ?", (source_file,)
+            ).fetchone()[0]
+            if source_file else 0
+        )
+        connection.commit()
+    if source_file and not remaining and Path(source_file).name == source_file:
+        stored_path = (DATA_DIR / source_file).resolve()
+        if stored_path.parent == DATA_DIR.resolve():
+            stored_path.unlink(missing_ok=True)
+    return {"deleted": True, "invoice_id": invoice_id}
 
 
 @app.get("/api/analytics/overview")
@@ -369,25 +528,30 @@ def assistant_query(payload: dict, request: Request,
     question = str(payload.get("question", "")).strip()
     if not question:
         raise HTTPException(status_code=400, detail="A question is required.")
+    history = payload.get("history", [])
+    if not isinstance(history, list):
+        raise HTTPException(status_code=400, detail="Conversation history must be a list.")
+    if len(question) > 1000:
+        raise HTTPException(status_code=413, detail="Question exceeds the 1000-character limit.")
+    history = [
+        {
+            "role": entry.get("role"),
+            "content": str(entry.get("content", ""))[:1000],
+            "context": {
+                key: value[:120]
+                for key, value in entry.get("context", {}).items()
+                if key in {"vendor", "category"} and isinstance(value, str)
+            } if isinstance(entry.get("context"), dict) else {},
+        }
+        for entry in history[-8:]
+        if isinstance(entry, dict) and entry.get("role") in {"user", "assistant"}
+    ]
     try:
-        import requests
-        response = requests.post(
-            f"{OLLAMA_HOST.rstrip('/')}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": (
-                "Convert this question into one read-only invoice SQLite SELECT query. "
-                "Use invoices, invoice_items and expense_categories. Return SQL only. "
-                "Financial totals must include only rows where validation_status = 'Verified'. "
-                f"Question: {question}"
-            ), "stream": False},
-            timeout=60,
-        )
-        response.raise_for_status()
-        query = response.json().get("response", "").replace("```sql", "").replace("```", "").strip()
-        rows = execute_read_only(DB_PATH, query)
-        return {"question": question, "query": query, "rows": rows}
-    except Exception:
+        result = answer_question(DB_PATH, question, history)
+        return {"question": question, **result}
+    except sqlite3.DatabaseError:
         logger.exception("Expense assistant request failed")
-        raise HTTPException(status_code=502, detail="Assistant request failed. Check local Ollama status and retry.")
+        raise HTTPException(status_code=500, detail="Assistant database query failed.")
 
 
 @app.get("/api/reports/export")

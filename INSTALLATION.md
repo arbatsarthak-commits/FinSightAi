@@ -6,15 +6,18 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-Install Tesseract OCR 5.5 and Ollama. Pull Mistral:
+Install Tesseract OCR 5.5 and Ollama. Pull the speed-oriented default:
 
 ```powershell
-ollama pull mistral
+ollama pull qwen2.5:1.5b
 ollama serve
 .\start_all.ps1
 ```
 
-Tesseract and Ollama settings can be overridden with environment variables from `.env.example`.
+For the optional Qwen 2.5 3B profile, run `ollama pull qwen2.5:3b` and set
+`OLLAMA_MODEL=qwen2.5:3b` in the ignored root `.env`. Copy `.env.example` to
+`.env` to configure the model and OCR limits. PowerShell environment variables
+override `.env` values.
 
 # Docker
 

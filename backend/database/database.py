@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS processing_logs (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    job_id TEXT PRIMARY KEY,
+    upload_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_stage TEXT NOT NULL,
+    stages_json TEXT NOT NULL,
+    result_json TEXT,
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -204,6 +216,7 @@ def get_dashboard_data(db_path: str | Path) -> dict:
             """
             SELECT COALESCE(SUM(CASE WHEN validation_status = 'Verified' THEN grand_total ELSE 0 END), 0) AS total_expenses,
                    COALESCE(SUM(CASE WHEN validation_status = 'Verified' THEN 1 ELSE 0 END), 0) AS total_invoices,
+                   COUNT(*) AS invoice_count,
                    COALESCE(SUM(CASE WHEN validation_status = 'Verified' THEN total_tax ELSE 0 END), 0) AS total_tax,
                    COALESCE(AVG(CASE WHEN validation_status = 'Verified' THEN grand_total END), 0) AS average_invoice,
                    COALESCE(SUM(CASE WHEN validation_status != 'Verified' OR validation_status IS NULL THEN 1 ELSE 0 END), 0) AS needs_attention
@@ -272,3 +285,43 @@ def get_invoice_details(db_path: str | Path, invoice_id: int) -> dict:
             "items": [dict(row) for row in items],
             "logs": [dict(row) for row in logs],
         }
+
+
+def save_processing_job(db_path: str | Path, job: dict) -> None:
+    with db_connection(db_path) as connection:
+        connection.execute(
+            """INSERT OR REPLACE INTO processing_jobs
+               (job_id, upload_id, status, current_stage, stages_json, result_json,
+                error, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                job["job_id"], job["upload_id"], job["status"], job["current_stage"],
+                json.dumps(job.get("stages", {}), ensure_ascii=False),
+                json.dumps(job["result"], ensure_ascii=False) if job.get("result") is not None else None,
+                job.get("error"), job["created_at"], job.get("updated_at", job["created_at"]),
+            ),
+        )
+
+
+def load_processing_jobs(db_path: str | Path, since: float) -> list[dict]:
+    with db_connection(db_path) as connection:
+        rows = connection.execute(
+            """SELECT job_id, upload_id, status, current_stage, stages_json,
+                      result_json, error, created_at, updated_at
+               FROM processing_jobs WHERE created_at >= ? ORDER BY created_at""",
+            (since,),
+        ).fetchall()
+    return [
+        {
+            "job_id": row["job_id"],
+            "upload_id": row["upload_id"],
+            "status": row["status"],
+            "current_stage": row["current_stage"],
+            "stages": json.loads(row["stages_json"]),
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]

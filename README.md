@@ -1,14 +1,15 @@
 # FinSightAI
 
-FinSightAI is a React dashboard backed by a FastAPI service that runs on your Windows computer. The browser uploads invoices to that local service; Tesseract and OpenCV process them, Ollama runs Mistral extraction, and SQLite stores the results locally. GitHub Pages hosts only the static frontend.
+FinSightAI is a React dashboard backed by a FastAPI service that runs on your Windows computer. The browser uploads invoices to that local service; Tesseract and OpenCV process them, Ollama runs configurable Qwen extraction, and SQLite stores the results locally. GitHub Pages hosts only the static frontend.
 
 ## Features
 
 - JPG, PNG, and PDF invoice uploads with OpenCV preprocessing and Tesseract OCR
-- Mistral/Ollama structured extraction and categorization
+- Qwen 2.5 1.5B/Ollama structured extraction by default; Qwen 2.5 3B is configurable where additional extraction capacity is preferred
 - GST-aware financial validation and file/invoice-number duplicate detection
 - SQLite invoice history, processing logs, CSV export, and verified-expense analytics
-- Dashboard charts, processing progress, and a read-only natural-language SQL assistant
+- Dashboard charts, restart-aware processing jobs, and a conversational assistant using fixed, parameterized SQLite queries
+- Authenticated invoice corrections and deletion, OCR field evidence, and local hardware/model status
 - Optional LayoutLMv3 checkpoint inference; the standard workflow does not require it
 
 ## Architecture
@@ -19,7 +20,7 @@ Browser (local Vite or GitHub Pages)
       └─ FastAPI on 127.0.0.1:8000
           ├─ invoice upload and processing status
           ├─ OpenCV preprocessing → Tesseract OCR
-          ├─ Ollama / Mistral extraction and validation
+          ├─ Ollama / Qwen extraction and validation
           └─ local SQLite database and analytics
 ```
 
@@ -31,7 +32,7 @@ The backend is not hosted by GitHub Pages and is not exposed to the public inter
 - Python 3.11 or later (use a version compatible with the pinned packages)
 - Node.js 24 and npm
 - Tesseract OCR 5, installed locally
-- Ollama, with the `mistral` model downloaded
+- Ollama, with `qwen2.5:1.5b` downloaded (optional alternative: `qwen2.5:3b`)
 
 ## Local setup
 
@@ -54,15 +55,15 @@ Set-Location ..
 
 If PowerShell blocks environment activation, either adjust the policy for the current process or run the virtual-environment Python by its full path as the startup script does.
 
-### Ollama and Mistral
+### Ollama and Qwen
 
 Install Ollama, then download the model:
 
 ```powershell
-ollama pull mistral
+ollama pull qwen2.5:1.5b
 ```
 
-Ollama normally starts its local service automatically. If it is not running, start `ollama serve` in a separate terminal. The backend defaults to `http://localhost:11434` and model `mistral`; override these with `OLLAMA_HOST` and `OLLAMA_MODEL` in the backend terminal if needed.
+For the optional accuracy-oriented profile, install `ollama pull qwen2.5:3b` and select it with `OLLAMA_MODEL=qwen2.5:3b`. Ollama normally starts its local service automatically. If it is not running, start `ollama serve` in a separate terminal. The backend defaults to `http://localhost:11434` and model `qwen2.5:1.5b`. The backend reports whether the selected model is installed and will not download models automatically.
 
 ### Tesseract OCR
 
@@ -72,23 +73,33 @@ Install Tesseract OCR 5. The default executable path is `C:\Program Files\Tesser
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
 ```
 
-The backend checks this executable when OCR is requested and reports its version in System settings. The root `.env.example` documents settings but is not automatically loaded by the PowerShell startup script; set any overrides in that terminal.
+The backend checks this executable when OCR is requested and reports its version in System settings. It detects common Windows installation paths and PATH when `TESSERACT_CMD` is unset.
 
 ### Start the local backend and frontend
 
-Open two PowerShell terminals at the repository root.
+Copy the example environment file once, then edit local settings if desired:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+`.env` is loaded by the backend and is ignored by Git. Environment variables already set in PowerShell take precedence. Open two PowerShell terminals at the repository root.
 
 In the backend terminal, optionally set local service configuration and start FastAPI:
 
 ```powershell
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
 $env:OLLAMA_HOST = 'http://localhost:11434'
-$env:OLLAMA_MODEL = 'mistral'
+$env:OLLAMA_MODEL = 'qwen2.5:1.5b'
 $env:OLLAMA_NUM_CTX = '2048'
 $env:OLLAMA_NUM_PREDICT = '350'
 $env:OLLAMA_NUM_THREAD = '8'
 $env:OLLAMA_KEEP_ALIVE = '10m'
 $env:OCR_TEXT_LIMIT = '6000'
+$env:OCR_TIMEOUT_SECONDS = '25'
+$env:MAX_IMAGE_PIXELS = '40000000'
+$env:MAX_PDF_PAGES = '30'
 $env:FRONTEND_ORIGINS = 'http://127.0.0.1:5173,http://localhost:5173,https://arbatsarthak-commits.github.io'
 .\start_backend.ps1
 ```
@@ -134,7 +145,7 @@ The site is HTTPS while the local API uses HTTP on loopback. Chrome's Local Netw
 - **Backend connection fails:** confirm the backend terminal is still running at `127.0.0.1:8000`, use the current pairing token, and check the browser's local-network permission. For the hosted app, the CORS origin must be exactly `https://arbatsarthak-commits.github.io`.
 - **Unauthorized response:** reconnect and enter the token printed by the currently running backend. Do not put that token in a URL, source file, frontend `.env`, or GitHub configuration.
 - **OCR unavailable:** install Tesseract and set `TESSERACT_CMD` to its executable path before starting the backend.
-- **Mistral unavailable:** start Ollama, run `ollama pull mistral`, and confirm `OLLAMA_HOST` and `OLLAMA_MODEL` in the backend terminal.
+- **Selected model unavailable:** start Ollama, run `ollama pull qwen2.5:1.5b`, and confirm `OLLAMA_HOST` and `OLLAMA_MODEL` in `.env` or the backend terminal.
 - **Port is already in use:** stop the other local service or configure a coordinated port change in the backend, frontend API URL, and CORS settings.
 
 ## Local checks
