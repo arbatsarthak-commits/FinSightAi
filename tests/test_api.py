@@ -59,18 +59,21 @@ def test_private_endpoints_require_pairing():
 
 def test_github_pages_origin_is_allowed_for_local_backend():
     response = client.options(
-        "/api/health",
+        "/api/invoices/upload",
         headers={
             "Origin": "https://arbatsarthak-commits.github.io",
-            "Access-Control-Request-Method": "GET",
-            "Access-Control-Request-Headers": "x-pairing-token",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,x-pairing-token",
         },
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == (
         "https://arbatsarthak-commits.github.io"
     )
-    assert "x-pairing-token" in response.headers["access-control-allow-headers"].lower()
+    allowed_headers = response.headers["access-control-allow-headers"].lower()
+    assert "content-type" in allowed_headers
+    assert "x-pairing-token" in allowed_headers
+    assert "post" in response.headers["access-control-allow-methods"].lower()
 
 
 def test_manual_approval_and_edit_routes_are_removed():

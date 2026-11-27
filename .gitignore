@@ -36,6 +36,11 @@ screenshots/
 # Generated files
 extracted_text.txt
 outputocrimage/
+logs/
+*.log
+tmp/
+temp/
+*.tmp
 
 # Model weights
 *.pt

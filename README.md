@@ -1,42 +1,160 @@
-# AI-Powered Invoice Intelligence and Expense Analytics
+# FinSightAI
 
-An original React/FastAPI invoice processing application for image/PDF OCR, Mistral-based structured extraction, automatic financial validation and SQLite-backed expense analytics.
+FinSightAI is a React dashboard backed by a FastAPI service that runs on your Windows computer. The browser uploads invoices to that local service; Tesseract and OpenCV process them, Ollama runs Mistral extraction, and SQLite stores the results locally. GitHub Pages hosts only the static frontend.
 
-## Main Features
+## Features
 
-- Conditional OpenCV contrast enhancement, deskewing and Otsu thresholding
-- Tesseract OCR with page text, word boxes and confidence
-- JPG, JPEG, PNG and PDF support
-- Pydantic invoice schema with one batched Mistral/Ollama extraction and categorization request
-- GST-aware subtotal, tax and grand-total validation
-- Same-file and invoice-number duplicate detection before insertion
-- Automatic saving of validated invoices; incomplete or inconsistent records are marked Needs Attention
-- Per-stage progress and measured processing timings
-- Normalized SQLite tables and processing logs
-- React dashboard and Recharts analytics
-- Restricted read-only natural-language SQL assistant
-- Optional LayoutLMv3 checkpoint inference and training scaffold
-
-## Run Locally
-
-```powershell
-ollama pull mistral
-ollama serve
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-.\start_all.ps1
-```
-
-Open http://127.0.0.1:5173. The backend runs at http://127.0.0.1:8000. Configure Tesseract and Ollama using `.env.example`.
-
-The backend startup script creates a local pairing token and prints it in its terminal. Use **Connect backend** in the UI and enter that token. The frontend keeps the token in memory and does not bundle it.
+- JPG, PNG, and PDF invoice uploads with OpenCV preprocessing and Tesseract OCR
+- Mistral/Ollama structured extraction and categorization
+- GST-aware financial validation and file/invoice-number duplicate detection
+- SQLite invoice history, processing logs, CSV export, and verified-expense analytics
+- Dashboard charts, processing progress, and a read-only natural-language SQL assistant
+- Optional LayoutLMv3 checkpoint inference; the standard workflow does not require it
 
 ## Architecture
 
-Upload → file/hash validation → PDF conversion → OpenCV preprocessing → Tesseract OCR → Mistral extraction and categorization → Pydantic and financial validation → SQLite → analytics.
+```text
+Browser (local Vite or GitHub Pages)
+  └─ explicit Connect backend + local pairing token
+      └─ FastAPI on 127.0.0.1:8000
+          ├─ invoice upload and processing status
+          ├─ OpenCV preprocessing → Tesseract OCR
+          ├─ Ollama / Mistral extraction and validation
+          └─ local SQLite database and analytics
+```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [INSTALLATION.md](INSTALLATION.md), [USER_GUIDE.md](USER_GUIDE.md), and [MODEL_EVALUATION.md](MODEL_EVALUATION.md).
+The backend is not hosted by GitHub Pages and is not exposed to the public internet. The browser submits the pairing token only after the user enters it; it stays in memory and is not built into the frontend. The backend accepts only configured frontend origins and binds to loopback when started with the supplied script.
 
-## LayoutLMv3 Status
+## Required software
 
-LayoutLMv3 is optional and is never downloaded at startup. Set `LAYOUTLM_MODEL` to a local fine-tuned checkpoint or Hugging Face checkpoint. The standard OCR+Mistral workflow remains usable without it. No GST-specific pretrained accuracy is claimed.
+- Windows PowerShell
+- Python 3.11 or later (use a version compatible with the pinned packages)
+- Node.js 24 and npm
+- Tesseract OCR 5, installed locally
+- Ollama, with the `mistral` model downloaded
+
+## Local setup
+
+From the repository root, create and populate the Python environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Install the frontend dependencies:
+
+```powershell
+Set-Location .\frontend
+npm ci
+Set-Location ..
+```
+
+If PowerShell blocks environment activation, either adjust the policy for the current process or run the virtual-environment Python by its full path as the startup script does.
+
+### Ollama and Mistral
+
+Install Ollama, then download the model:
+
+```powershell
+ollama pull mistral
+```
+
+Ollama normally starts its local service automatically. If it is not running, start `ollama serve` in a separate terminal. The backend defaults to `http://localhost:11434` and model `mistral`; override these with `OLLAMA_HOST` and `OLLAMA_MODEL` in the backend terminal if needed.
+
+### Tesseract OCR
+
+Install Tesseract OCR 5. The default executable path is `C:\Program Files\Tesseract-OCR\tesseract.exe`. If yours differs, set it in the backend terminal before starting FastAPI:
+
+```powershell
+$env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
+```
+
+The backend checks this executable when OCR is requested and reports its version in System settings. The root `.env.example` documents settings but is not automatically loaded by the PowerShell startup script; set any overrides in that terminal.
+
+### Start the local backend and frontend
+
+Open two PowerShell terminals at the repository root.
+
+In the backend terminal, optionally set local service configuration and start FastAPI:
+
+```powershell
+$env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
+$env:OLLAMA_HOST = 'http://localhost:11434'
+$env:OLLAMA_MODEL = 'mistral'
+$env:FRONTEND_ORIGINS = 'http://127.0.0.1:5173,http://localhost:5173,https://arbatsarthak-commits.github.io'
+.\start_backend.ps1
+```
+
+The script generates and stores a random local pairing token in the ignored `.local-api-token` file if one does not already exist. Keep the token private; enter it only into the app's **Connect backend** prompt. The API listens on `127.0.0.1:8000`.
+
+In the frontend terminal:
+
+```powershell
+Set-Location .\frontend
+npm run dev -- --host 127.0.0.1
+```
+
+Open `http://127.0.0.1:5173/`, choose **Connect backend**, and enter the token shown by the backend terminal. The frontend uses hash-based routes, so direct navigation and refreshes work both locally and under the GitHub Pages subdirectory.
+
+Check backend health with:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/health
+```
+
+## GitHub Pages deployment
+
+The workflow at `.github/workflows/deploy.yml` deploys the frontend when code is pushed to `main`; it also supports **Run workflow** through `workflow_dispatch`. It installs with `npm ci`, builds `frontend/` with Vite base path `/FinSightAi/`, and publishes `frontend/dist` using the official GitHub Pages actions.
+
+1. In the GitHub repository, open **Settings → Pages** and set the build/deployment source to **GitHub Actions**.
+2. Push the reviewed changes to `main`, or run **Actions → Deploy React frontend → Run workflow**.
+3. Check that the build and deploy jobs complete successfully.
+4. Visit <https://arbatsarthak-commits.github.io/FinSightAi/>.
+
+Pages serves only static frontend assets. It does not host FastAPI, Tesseract, Ollama, the pairing token, invoices, or SQLite. To use the hosted page, start the backend on the Windows computer that should process the invoices, then select **Connect backend** on the hosted page and enter that computer's local pairing token. The production frontend's `http://127.0.0.1:8000` API address deliberately means the visitor's own computer; it is not a public backend URL or a Vite development-server address.
+
+The backend already allows the Pages origin `https://arbatsarthak-commits.github.io` in CORS. Origins are host-only: do not append `/FinSightAi/`. Keep `LOCAL_API_TOKEN` on the backend. Never set it as a `VITE_*` value, GitHub Actions build variable, or frontend environment variable.
+
+### Browser and local-network limitations
+
+The site is HTTPS while the local API uses HTTP on loopback. Chrome's Local Network Access permission (rolling out from Chrome 142) gates public-site requests to loopback; the HTTPS site may prompt for permission to access the local network. Grant it to `https://arbatsarthak-commits.github.io` in browser site settings, then retry. Other browsers and managed-browser policies may behave differently, including blocking local HTTP requests. See [Chrome's Local Network Access overview](https://developer.chrome.com/blog/local-network-access/). Do not disable browser security or expose/port-forward the backend to the internet to work around a blocked request. If the browser does not permit the connection, use the local Vite frontend at `http://127.0.0.1:5173/` instead.
+
+## Troubleshooting
+
+- **Pages assets return 404:** confirm Pages uses **GitHub Actions**, the deploy workflow succeeded, and the URL includes `/FinSightAi/`. The workflow sets the Vite base path; do not use the obsolete repository path.
+- **Refresh or a route fails:** routes use `HashRouter`; navigate using the links in the app and preserve the `/#/route` fragment.
+- **Backend connection fails:** confirm the backend terminal is still running at `127.0.0.1:8000`, use the current pairing token, and check the browser's local-network permission. For the hosted app, the CORS origin must be exactly `https://arbatsarthak-commits.github.io`.
+- **Unauthorized response:** reconnect and enter the token printed by the currently running backend. Do not put that token in a URL, source file, frontend `.env`, or GitHub configuration.
+- **OCR unavailable:** install Tesseract and set `TESSERACT_CMD` to its executable path before starting the backend.
+- **Mistral unavailable:** start Ollama, run `ollama pull mistral`, and confirm `OLLAMA_HOST` and `OLLAMA_MODEL` in the backend terminal.
+- **Port is already in use:** stop the other local service or configure a coordinated port change in the backend, frontend API URL, and CORS settings.
+
+## Local checks
+
+```powershell
+Set-Location .\frontend
+npm ci
+npm run build
+npm run lint
+Set-Location ..
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Build specifically for the Pages subdirectory and inspect the generated entry points:
+
+```powershell
+Set-Location .\frontend
+$env:VITE_BASE_PATH = '/FinSightAi/'
+$env:VITE_API_BASE_URL = 'http://127.0.0.1:8000'
+npm run build
+Get-Content .\dist\index.html
+```
+
+## Data and further documentation
+
+Environment files, the pairing-token file, SQLite databases, invoice uploads, logs, and generated OCR output are excluded by `.gitignore`. Confirm `git status` before staging files; never add local invoices, databases, tokens, or real `.env` files.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md), [INSTALLATION.md](INSTALLATION.md), [ARCHITECTURE.md](ARCHITECTURE.md), [USER_GUIDE.md](USER_GUIDE.md), and [MODEL_EVALUATION.md](MODEL_EVALUATION.md) for additional project details.
