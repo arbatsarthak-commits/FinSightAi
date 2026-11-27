@@ -1,0 +1,25 @@
+ ARCHITECTURE.md                          |  17 [32m+[m[31m-[m
+ README.md                                |  15 [32m+[m[31m-[m
+ USER_GUIDE.md                            |  16 [32m+[m[31m-[m
+ backend/database/database.py             |  74 [32m++++++[m[31m--[m
+ backend/llm/mistral_service.py           | 107 [32m++++++++[m[31m---[m
+ backend/main.py                          | 317 [32m+++++++++++++++[m[31m----------------[m
+ backend/models/invoice.py                |  39 [32m+++[m[31m-[m
+ backend/ocr/ocr_service.py               | 151 [32m++++++++++[m[31m-----[m
+ backend/preprocessing/image_processor.py |  27 [32m+[m[31m--[m
+ backend/schemas/invoice.py               |  34 [31m----[m
+ backend/services/invoice_pipeline.py     | 236 [32m++++++++++++++++++[m[31m-----[m
+ backend/validation/validation_engine.py  |  59 [32m++++[m[31m--[m
+ data/input/34df7ab88a4242bb.png          | Bin [31m0[m -> [32m15973[m bytes
+ data/input/69b70309cc402a1f.png          | Bin [31m0[m -> [32m15973[m bytes
+ data/input/a62c87f475474377.jpeg         | Bin [31m0[m -> [32m64984[m bytes
+ data/input/c22ab7b5a7894c3b.png          | Bin [31m0[m -> [32m15973[m bytes
+ data/input/f49b6a3de4f928c2.jpeg         | Bin [31m0[m -> [32m64984[m bytes
+ frontend/src/App.tsx                     |  59 [32m+++[m[31m---[m
+ tests/test_api.py                        | 189 [32m+++++++[m[31m-----------[m
+ tests/test_database.py                   |  62 [32m++++++[m
+ tests/test_invoice_pipeline.py           | 132 [32m+++++++++++++[m
+ tests/test_mistral.py                    |   2 [32m+[m[31m-[m
+ tests/test_ocr.py                        |  77 [32m++++++++[m
+ tests/test_validation.py                 |  73 [32m++++++[m[31m-[m
+ 24 files changed, 1142 insertions(+), 544 deletions(-)
