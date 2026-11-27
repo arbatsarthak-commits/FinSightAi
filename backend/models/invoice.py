@@ -1,4 +1,5 @@
 from typing import Optional
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -82,6 +83,18 @@ class InvoiceData(BaseModel):
     grand_total: Optional[float] = None
     currency: str = "INR"
     payment_status: Optional[str] = None
+
+    @field_validator("invoice_date", "due_date", mode="before")
+    @classmethod
+    def normalize_date(cls, value):
+        if not isinstance(value, str) or not value.strip():
+            return value
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(value.strip(), fmt).date().isoformat()
+            except ValueError:
+                continue
+        return value
 
     @field_validator(
         "subtotal", "cgst", "sgst", "igst", "total_tax", "grand_total",

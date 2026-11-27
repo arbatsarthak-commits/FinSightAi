@@ -30,6 +30,34 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def field_evidence(raw_text: str, invoice: dict) -> dict:
+    evidence = {}
+    text_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    field_aliases = {
+        "invoice_number": ("invoice number", "invoice no", "invoice #", "bill number"),
+        "invoice_date": ("invoice date", "date"),
+        "vendor_name": ("vendor", "from", "billed by"),
+        "vendor_gstin": ("gstin", "gst in", "gst no"),
+        "subtotal": ("subtotal", "taxable amount", "taxable subtotal"),
+        "total_tax": ("total tax", "gst total", "tax amount"),
+        "grand_total": ("grand total", "invoice total", "amount payable", "total payable"),
+    }
+    for field, aliases in field_aliases.items():
+        value = invoice.get(field)
+        if value in (None, ""):
+            evidence[field] = {"source": "missing", "line": None}
+            continue
+        matches = [
+            line for line in text_lines
+            if any(alias in line.lower() for alias in aliases)
+        ]
+        evidence[field] = {
+            "source": "ocr",
+            "line": matches[0][:240] if matches else None,
+        }
+    return evidence
+
+
 def process_invoice(
     source: str | Path,
     stage_callback: Callable[[str, str, str | None], None] | None = None,
@@ -118,6 +146,7 @@ def process_invoice(
         invoice_data, model_performance = extract_invoice_with_metrics(ocr["text"])
         performance.update(model_performance)
         invoice = invoice_data.model_dump()
+        evidence = field_evidence(ocr["text"], invoice)
         report("Mistral invoice extraction", "Complete")
 
         report("Invoice-number duplicate check", "Processing")
@@ -211,6 +240,7 @@ def process_invoice(
     return {
         "invoice_id": invoice_id,
         "invoice": invoice,
+        "evidence": evidence,
         "ocr": {
             "text": ocr["text"],
             "pages": ocr["pages"],

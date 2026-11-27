@@ -84,6 +84,11 @@ In the backend terminal, optionally set local service configuration and start Fa
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
 $env:OLLAMA_HOST = 'http://localhost:11434'
 $env:OLLAMA_MODEL = 'mistral'
+$env:OLLAMA_NUM_CTX = '2048'
+$env:OLLAMA_NUM_PREDICT = '350'
+$env:OLLAMA_NUM_THREAD = '8'
+$env:OLLAMA_KEEP_ALIVE = '10m'
+$env:OCR_TEXT_LIMIT = '6000'
 $env:FRONTEND_ORIGINS = 'http://127.0.0.1:5173,http://localhost:5173,https://arbatsarthak-commits.github.io'
 .\start_backend.ps1
 ```
