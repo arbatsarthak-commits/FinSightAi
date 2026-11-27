@@ -1,12 +1,13 @@
-import type { ReactNode } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { HashRouter, NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { BarChart3, Bot, ChevronRight, FileText, LayoutDashboard, Settings, UploadCloud, Wifi, WifiOff, Send, Trash2, Pencil, X, Check, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react'
+import { BarChart3, Bot, ChevronRight, FileText, LayoutDashboard, Settings, UploadCloud, Wifi, WifiOff, Send, Trash2, Pencil, X, Check, ChevronLeft, ChevronRight as ChevronRightIcon, Eye, EyeOff, LoaderCircle } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { api, apiBaseUrl, downloadReport, setApiBaseUrl, setPairingToken } from './services/api'
+import { api, apiBaseUrl, connectToBackend, downloadReport, getApiConfigurationError } from './services/api'
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } } })
+const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000'
 
 type Invoice = {
   id: number
@@ -31,7 +32,43 @@ export default function App() {
 
 function Shell() {
   const [connected, setConnected] = useState<boolean | null>(null)
+  const [connectionModalOpen, setConnectionModalOpen] = useState(false)
+  const [backendUrl, setBackendUrl] = useState(apiBaseUrl || DEFAULT_BACKEND_URL)
+  const [pairingToken, setPairingToken] = useState('')
+  const [showPairingToken, setShowPairingToken] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState('')
+  const [connectionError, setConnectionError] = useState('')
+  const [connecting, setConnecting] = useState(false)
   const navigate = useNavigate()
+  function openConnectionModal() {
+    setBackendUrl(apiBaseUrl || DEFAULT_BACKEND_URL)
+    setPairingToken('')
+    setShowPairingToken(false)
+    setConnectionStatus('')
+    setConnectionError(getApiConfigurationError())
+    setConnectionModalOpen(true)
+  }
+  function closeConnectionModal() {
+    setPairingToken('')
+    setConnectionModalOpen(false)
+  }
+  async function connect(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setConnectionError('')
+    setConnectionStatus('')
+    setConnecting(true)
+    try {
+      await connectToBackend(backendUrl, pairingToken, setConnectionStatus)
+      setConnected(true)
+      closeConnectionModal()
+      await queryClient.invalidateQueries()
+    } catch (error) {
+      setConnected(false)
+      setConnectionError(error instanceof Error ? error.message : 'The backend connection failed. Check the URL, token, and network permissions.')
+    } finally {
+      setConnecting(false)
+    }
+  }
   const nav = [
     ['/', 'Dashboard', LayoutDashboard],
     ['/upload', 'Upload invoice', UploadCloud],
@@ -40,30 +77,6 @@ function Shell() {
     ['/assistant', 'AI assistant', Bot],
     ['/settings', 'Settings', Settings],
   ] as const
-  async function connect() {
-    if (!apiBaseUrl) {
-      const backendUrl = window.prompt('Enter the backend API URL (remote backends must use HTTPS).')
-      if (!backendUrl) return
-      try {
-        setApiBaseUrl(backendUrl)
-      } catch (error) {
-        window.alert(error instanceof Error ? error.message : 'The backend URL is invalid.')
-        return
-      }
-    }
-    const token = window.prompt('Enter the backend pairing token.')
-    if (!token) return
-    setPairingToken(token.trim())
-    try {
-      await api('/api/system/status')
-      setConnected(true)
-      queryClient.invalidateQueries()
-    } catch (error) {
-      setPairingToken('')
-      setConnected(false)
-      window.alert(error instanceof Error ? error.message : 'Could not connect. Check the pairing token, backend, and browser local-network permission.')
-    }
-  }
   return (
     <div className="min-h-screen bg-[#f4f6fb] text-slate-900">
       <aside className="fixed left-0 top-0 z-20 hidden h-screen w-64 border-r border-slate-800 bg-[#10182a] px-4 py-6 md:block">
@@ -79,7 +92,7 @@ function Shell() {
             </NavLink>
           ))}
         </nav>
-        <button onClick={connect} className="absolute bottom-6 left-4 right-4 flex items-center justify-between rounded-lg border border-slate-700 px-3 py-3 text-sm text-slate-300 hover:bg-white/5">
+        <button onClick={openConnectionModal} className="absolute bottom-6 left-4 right-4 flex items-center justify-between rounded-lg border border-slate-700 px-3 py-3 text-sm text-slate-300 hover:bg-white/5">
           <span className="flex items-center gap-2">{connected ? <Wifi size={16} className="text-emerald-400"/> : <WifiOff size={16}/>} {connected === true ? 'Backend connected' : 'Connect backend'}</span>
           <ChevronRight size={16}/>
         </button>
@@ -87,7 +100,7 @@ function Shell() {
       <div className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur md:hidden">
         <div className="flex items-center justify-between">
           <button className="flex items-center gap-2 font-semibold" onClick={() => navigate('/')}><span className="grid h-8 w-8 place-items-center rounded-lg bg-indigo-600 text-white">F</span>FinSightAI</button>
-          <button onClick={connect} className="flex items-center gap-2 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium">{connected ? <Wifi size={14} className="text-emerald-600"/> : <WifiOff size={14}/>} {connected ? 'Connected' : 'Connect'}</button>
+          <button onClick={openConnectionModal} className="flex items-center gap-2 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium">{connected ? <Wifi size={14} className="text-emerald-600"/> : <WifiOff size={14}/>} {connected ? 'Connected' : 'Connect'}</button>
         </div>
         <nav className="mt-3 flex gap-1 overflow-x-auto pb-1" aria-label="Mobile navigation">
           {nav.map(([to, label, Icon]) => <NavLink key={to} to={to} className={({isActive}) => `flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs ${isActive ? 'bg-indigo-50 font-semibold text-indigo-700' : 'text-slate-500'}`}><Icon size={14}/>{label}</NavLink>)}
@@ -103,6 +116,37 @@ function Shell() {
           <Route path="/settings" element={<SettingsPage/>}/>
         </Routes>
       </div></main>
+      {connectionModalOpen&&<section className="fixed inset-0 z-50 grid place-items-center bg-slate-950/55 p-4" role="presentation">
+        <div role="dialog" aria-modal="true" aria-labelledby="connect-backend-title" className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl">
+          <div className="flex items-start justify-between gap-4">
+            <div><h2 id="connect-backend-title" className="text-xl font-bold text-slate-900">Connect backend</h2><p className="mt-1 text-sm text-slate-500">Connect securely to your FinSightAI backend.</p></div>
+            <button type="button" onClick={closeConnectionModal} disabled={connecting} aria-label="Close connection window" className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 disabled:opacity-50"><X size={18}/></button>
+          </div>
+          <form onSubmit={connect} className="mt-6 space-y-4">
+            <div>
+              <label htmlFor="backend-api-url" className="mb-1.5 block text-sm font-semibold text-slate-800">Backend API URL</label>
+              <input id="backend-api-url" type="text" inputMode="url" autoComplete="url" spellCheck={false} value={backendUrl} onChange={(event)=>{setBackendUrl(event.target.value);setConnectionError('')}} className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-100"/>
+              <p className="mt-1.5 text-xs text-slate-500">Use the local URL printed by the backend, or an HTTPS URL for a remote backend.</p>
+            </div>
+            <div>
+              <label htmlFor="backend-pairing-token" className="mb-1.5 block text-sm font-semibold text-slate-800">Pairing Token</label>
+              <div className="relative">
+                <input id="backend-pairing-token" type={showPairingToken?'text':'password'} autoComplete="off" value={pairingToken} onChange={(event)=>{setPairingToken(event.target.value);setConnectionError('')}} className="w-full rounded-lg border border-slate-300 px-3 py-2.5 pr-12 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-100"/>
+                <button type="button" onClick={()=>setShowPairingToken((visible)=>!visible)} aria-label={showPairingToken?'Hide pairing token':'Show pairing token'} aria-pressed={showPairingToken} className="absolute inset-y-0 right-0 grid w-11 place-items-center text-slate-500 hover:text-slate-800">
+                  {showPairingToken?<EyeOff size={18}/>:<Eye size={18}/>}
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-slate-500">Copy the pairing token from your VS Code backend terminal and paste it here.</p>
+            </div>
+            {connectionStatus&&<p role="status" aria-live="polite" className="flex items-center gap-2 rounded-lg bg-blue-50 p-3 text-sm text-blue-800">{connecting&&<LoaderCircle size={16} className="animate-spin"/>}{connectionStatus}</p>}
+            {connectionError&&<p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-800">{connectionError}</p>}
+            <div className="flex justify-end gap-3 pt-2">
+              <button type="button" onClick={closeConnectionModal} disabled={connecting} className="rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">Cancel</button>
+              <button type="submit" disabled={connecting} className="inline-flex min-w-28 items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 disabled:cursor-wait disabled:opacity-70">{connecting&&<LoaderCircle size={16} className="animate-spin"/>}{connecting?'Connecting…':'Connect'}</button>
+            </div>
+          </form>
+        </div>
+      </section>}
     </div>
   )
 }
